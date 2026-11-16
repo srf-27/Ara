@@ -331,7 +331,6 @@ pub fn bind_udp(port: u16) -> Result<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let sock = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
     sock.set_only_v6(false)?;
-    sock.set_reuse_address(true)?;
     sock.bind(&SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port)).into())?;
     sock.set_nonblocking(true)?;
     UdpSocket::from_std(sock.into()).context("tokio udp")

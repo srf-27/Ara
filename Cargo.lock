@@ -82,6 +82,7 @@ name = "ara"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ara-server",
  "base64 0.22.1",
  "boringtun",
  "clap",

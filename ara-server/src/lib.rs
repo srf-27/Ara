@@ -128,7 +128,7 @@ impl State {
                     .collect()
             })
             .unwrap_or_default();
-        out.sort_by(|a, b| a.virtual_ip.cmp(&b.virtual_ip));
+        out.sort_by_key(|p| p.virtual_ip);
         out
     }
 
@@ -152,6 +152,7 @@ pub async fn serve(listener: TcpListener, udp: Arc<UdpSocket>) -> Result<()> {
                 match udp.recv_from(&mut buf).await {
                     Ok((n, src)) => {
                         if let Some(txid) = stun::parse_request(&buf[..n]) {
+                            tracing::debug!("stun request from {src}");
                             let resp = stun::encode_response(&txid, src);
                             let _ = udp.send_to(&resp, src).await;
                         }

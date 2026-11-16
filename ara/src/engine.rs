@@ -58,6 +58,15 @@ fn action(res: TunnResult<'_>) -> Action {
     }
 }
 
+/// Our socket is dual-stack IPv6; Windows requires IPv4 targets to be
+/// v4-mapped or sendto fails with WSAEFAULT.
+fn target(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V4(v4) => SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port()),
+        v6 => v6,
+    }
+}
+
 async fn apply(socket: &UdpSocket, ip_in: &mpsc::Sender<Vec<u8>>, peer: &Peer, act: Action) {
     match act {
         Action::Send(bytes) => {
@@ -66,7 +75,7 @@ async fn apply(socket: &UdpSocket, ip_in: &mpsc::Sender<Vec<u8>>, peer: &Peer, a
                 None => peer.candidates.clone(),
             };
             for t in targets {
-                let _ = socket.send_to(&bytes, t).await;
+                let _ = socket.send_to(&bytes, target(t)).await;
             }
         }
         Action::ToTun(bytes) => {
@@ -82,7 +91,7 @@ async fn punch(socket: &UdpSocket, peer: &mut Peer) {
     let res = peer.tunn.format_handshake_initiation(&mut dst_buf, false);
     if let TunnResult::WriteToNetwork(bytes) = res {
         for c in &peer.candidates {
-            let _ = socket.send_to(bytes, *c).await;
+            let _ = socket.send_to(bytes, target(*c)).await;
         }
     }
 }
@@ -177,6 +186,7 @@ impl Engine {
                 };
                 self.next_index += 1;
                 self.vip_to_key.insert(info.virtual_ip, info.public_key.clone());
+                tracing::debug!("add peer {} vip {} candidates {:?}", info.public_key, info.virtual_ip, info.candidates);
                 let mut peer = Peer {
                     tunn,
                     virtual_ip: info.virtual_ip,
@@ -199,7 +209,8 @@ impl Engine {
                 let mut txid = [0u8; 12];
                 rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut txid);
                 let req = stun::encode_request(&txid);
-                if self.socket.send_to(&req, server).await.is_ok() {
+                tracing::debug!("stun request to {server}");
+                if self.socket.send_to(&req, target(server)).await.is_ok() {
                     self.pending_stun = Some((txid, Instant::now(), reply));
                 } else {
                     let _ = reply.send(None);
@@ -238,6 +249,7 @@ impl Engine {
         if let Some((txid, _, _)) = &self.pending_stun {
             if datagram.len() >= 20 && datagram[8..20] == *txid {
                 if let Some(addr) = stun::parse_response(datagram) {
+                    tracing::debug!("stun reflexive {addr}");
                     if let Some((_, _, reply)) = self.pending_stun.take() {
                         let _ = reply.send(Some(addr));
                     }
@@ -300,7 +312,7 @@ impl Engine {
                 let stale = peer
                     .tunn
                     .time_since_last_handshake()
-                    .map_or(true, |d| d > Duration::from_secs(30));
+                    .is_none_or(|d| d > Duration::from_secs(30));
                 (action(res), stale && now.duration_since(peer.last_punch) > PUNCH_INTERVAL)
             };
             if let Some(peer) = self.peers.get(&key) {

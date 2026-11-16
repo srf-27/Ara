@@ -29,6 +29,7 @@ struct Network {
 struct Peer {
     virtual_ip: Ipv4Addr,
     candidates: Vec<SocketAddr>,
+    tcp: Vec<SocketAddr>,
     last_seen: Instant,
 }
 
@@ -44,6 +45,7 @@ impl State {
         secret: &str,
         public_key: &str,
         candidates: Vec<SocketAddr>,
+        tcp: Vec<SocketAddr>,
     ) -> Result<Ipv4Addr, String> {
         let net = self
             .networks
@@ -73,15 +75,16 @@ impl State {
         };
         net.peers.insert(
             public_key.to_string(),
-            Peer { virtual_ip: vip, candidates, last_seen: Instant::now() },
+            Peer { virtual_ip: vip, candidates, tcp, last_seen: Instant::now() },
         );
         Ok(vip)
     }
 
-    pub fn update_candidates(&mut self, network: &str, public_key: &str, candidates: Vec<SocketAddr>) {
+    pub fn update_candidates(&mut self, network: &str, public_key: &str, candidates: Vec<SocketAddr>, tcp: Vec<SocketAddr>) {
         if let Some(net) = self.networks.get_mut(network) {
             if let Some(p) = net.peers.get_mut(public_key) {
                 p.candidates = candidates;
+                p.tcp = tcp;
                 p.last_seen = Instant::now();
             }
         }
@@ -126,6 +129,7 @@ impl State {
                         public_key: k.clone(),
                         virtual_ip: p.virtual_ip,
                         candidates: p.candidates.clone(),
+                        tcp: p.tcp.clone(),
                     })
                     .collect()
             })
@@ -294,7 +298,7 @@ async fn handle_conn(
     let WsMessage::Text(text) = first else {
         anyhow::bail!("expected text register");
     };
-    let Message::Register { network, secret, public_key, candidates } = proto::decode(&text)?
+    let Message::Register { network, secret, public_key, candidates, tcp } = proto::decode(&text)?
     else {
         let _ = sink
             .send(WsMessage::Text(proto::encode(&Message::Error {
@@ -307,7 +311,7 @@ async fn handle_conn(
     let mut rx = bcast.subscribe();
     let vip = {
         let mut st = state.lock().await;
-        match st.register(&network, &secret, &public_key, candidates) {
+        match st.register(&network, &secret, &public_key, candidates, tcp) {
             Ok(vip) => vip,
             Err(reason) => {
                 let _ = sink
@@ -334,8 +338,8 @@ async fn handle_conn(
             msg = stream.next() => {
                 match msg {
                     Some(Ok(WsMessage::Text(text))) => match proto::decode(&text) {
-                        Ok(Message::Candidates { candidates }) => {
-                            state.lock().await.update_candidates(&network, &public_key, candidates);
+                        Ok(Message::Candidates { candidates, tcp }) => {
+                            state.lock().await.update_candidates(&network, &public_key, candidates, tcp);
                             broadcast_peers(&state, &bcast, &network).await;
                         }
                         Ok(Message::Heartbeat) => {
@@ -394,12 +398,12 @@ mod tests {
     #[test]
     fn sequential_allocation_and_reclaim() {
         let mut s = State::new();
-        let a = s.register("n", "sec", "keyA", cands()).unwrap();
-        let b = s.register("n", "sec", "keyB", cands()).unwrap();
+        let a = s.register("n", "sec", "keyA", cands(), vec![]).unwrap();
+        let b = s.register("n", "sec", "keyB", cands(), vec![]).unwrap();
         assert_eq!(a, Ipv4Addr::new(10, 99, 0, 1));
         assert_eq!(b, Ipv4Addr::new(10, 99, 0, 2));
         // re-register A keeps its IP
-        let a2 = s.register("n", "sec", "keyA", cands()).unwrap();
+        let a2 = s.register("n", "sec", "keyA", cands(), vec![]).unwrap();
         assert_eq!(a, a2);
         assert_eq!(s.peers("n").len(), 2);
     }
@@ -407,15 +411,15 @@ mod tests {
     #[test]
     fn wrong_secret_rejected() {
         let mut s = State::new();
-        s.register("n", "sec", "keyA", cands()).unwrap();
-        assert!(s.register("n", "other", "keyB", cands()).is_err());
+        s.register("n", "sec", "keyA", cands(), vec![]).unwrap();
+        assert!(s.register("n", "other", "keyB", cands(), vec![]).is_err());
     }
 
     #[test]
     fn separate_networks_isolated() {
         let mut s = State::new();
-        let a = s.register("n1", "s1", "k", cands()).unwrap();
-        let b = s.register("n2", "s2", "k", cands()).unwrap();
+        let a = s.register("n1", "s1", "k", cands(), vec![]).unwrap();
+        let b = s.register("n2", "s2", "k", cands(), vec![]).unwrap();
         assert_eq!(a, b); // each network starts at .2
         assert_eq!(s.peers("n1").len(), 1);
         assert_eq!(s.peers("n2").len(), 1);
@@ -424,10 +428,10 @@ mod tests {
     #[test]
     fn remove_and_sweep() {
         let mut s = State::new();
-        s.register("n", "sec", "keyA", cands()).unwrap();
+        s.register("n", "sec", "keyA", cands(), vec![]).unwrap();
         s.remove("n", "keyA");
         assert_eq!(s.peers("n").len(), 0);
-        s.register("n", "sec", "keyB", cands()).unwrap();
+        s.register("n", "sec", "keyB", cands(), vec![]).unwrap();
         // fresh peer survives sweep
         assert!(s.sweep().is_empty());
         assert_eq!(s.peers("n").len(), 1);
@@ -436,9 +440,9 @@ mod tests {
     #[test]
     fn candidates_update() {
         let mut s = State::new();
-        s.register("n", "sec", "k", cands()).unwrap();
+        s.register("n", "sec", "k", cands(), vec![]).unwrap();
         let new: Vec<SocketAddr> = vec!["9.9.9.9:1".parse().unwrap()];
-        s.update_candidates("n", "k", new.clone());
+        s.update_candidates("n", "k", new.clone(), vec![]);
         assert_eq!(s.peers("n")[0].candidates, new);
     }
 }

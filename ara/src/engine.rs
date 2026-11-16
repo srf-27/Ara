@@ -18,6 +18,10 @@ use crate::proto::PeerInfo;
 use crate::{stun, KEEPALIVE_SECS};
 
 const BUF: usize = 2048;
+/// Direct-TCP transport is implemented but has a connection-lifecycle bug
+/// (conns drop right after establish); gated off until fixed. Relay fallback
+/// remains the working non-UDP path.
+const TCP_DIRECT: bool = false;
 const TICK: Duration = Duration::from_millis(250);
 const PUNCH_INTERVAL: Duration = Duration::from_secs(2);
 const STUN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -39,10 +43,17 @@ pub enum Command {
     /// Reconcile the peer table to exactly this list (drops stale peers).
     SetPeers(Vec<PeerInfo>),
     RemovePeer(String),
-    UpdateCandidates { public_key: String, candidates: Vec<SocketAddr> },
     Stun { server: SocketAddr, reply: oneshot::Sender<Option<SocketAddr>> },
     /// WG datagram arrived via the server relay (TCP), not UDP.
     RelayIn(Vec<u8>),
+    /// Outbound peer TCP connection established.
+    TcpUp { key: String, stream: tokio::net::TcpStream },
+    /// Inbound peer TCP connection accepted (peer identified on first packet).
+    TcpAccepted(tokio::net::TcpStream),
+    /// WG datagram arrived over a peer TCP connection (conn id for writer matching).
+    TcpIn { conn: u64, key: Option<String>, data: Vec<u8> },
+    /// A peer TCP connection closed.
+    TcpClosed(u64),
 }
 
 /// Owned copy of a TunnResult so we can release the peer borrow before doing IO.
@@ -80,11 +91,19 @@ async fn apply(
 ) {
     match act {
         Action::Send(bytes) => {
-            if peer.use_relay {
-                let mut frame = peer.key_bytes.to_vec();
-                frame.extend_from_slice(&bytes);
-                let _ = relay_out.send(frame).await;
-                return;
+            let direct_recent =
+                Instant::now().duration_since(peer.last_direct) < Duration::from_secs(10);
+            if !direct_recent {
+                if let Some(tx) = &peer.tcp_tx {
+                    let _ = tx.send(bytes).await;
+                    return;
+                }
+                if peer.use_relay {
+                    let mut frame = peer.key_bytes.to_vec();
+                    frame.extend_from_slice(&bytes);
+                    let _ = relay_out.send(frame).await;
+                    return;
+                }
             }
             let targets: Vec<SocketAddr> = match peer.endpoint {
                 Some(ep) => vec![ep],
@@ -106,6 +125,9 @@ async fn punch(socket: &UdpSocket, relay_out: &mpsc::Sender<Vec<u8>>, peer: &mut
     let mut dst_buf = [0u8; BUF];
     let res = peer.tunn.format_handshake_initiation(&mut dst_buf, false);
     if let TunnResult::WriteToNetwork(bytes) = res {
+        if let Some(tx) = &peer.tcp_tx {
+            let _ = tx.send(bytes.to_vec()).await;
+        }
         if peer.use_relay {
             let mut frame = peer.key_bytes.to_vec();
             frame.extend_from_slice(bytes);
@@ -122,6 +144,9 @@ struct Peer {
     key_bytes: [u8; 32],
     virtual_ip: Ipv4Addr,
     candidates: Vec<SocketAddr>,
+    tcp: Vec<SocketAddr>,
+    tcp_tx: Option<mpsc::Sender<Vec<u8>>>,
+    last_tcp_try: Instant,
     endpoint: Option<SocketAddr>,
     last_punch: Instant,
     created: Instant,
@@ -138,6 +163,9 @@ pub struct Engine {
     ip_in: mpsc::Sender<Vec<u8>>,
     relay_out: mpsc::Sender<Vec<u8>>,
     cmd: mpsc::Receiver<Command>,
+    cmd_tx: mpsc::Sender<Command>,
+    tcp_writers: HashMap<u64, mpsc::Sender<Vec<u8>>>,
+    next_conn: u64,
     next_index: u32,
     pending_stun: Option<([u8; 12], Instant, oneshot::Sender<Option<SocketAddr>>)>,
 }
@@ -150,6 +178,7 @@ impl Engine {
         ip_in: mpsc::Sender<Vec<u8>>,
         relay_out: mpsc::Sender<Vec<u8>>,
         cmd: mpsc::Receiver<Command>,
+        cmd_tx: mpsc::Sender<Command>,
     ) -> Self {
         Self {
             socket,
@@ -160,6 +189,9 @@ impl Engine {
             ip_in,
             relay_out,
             cmd,
+            cmd_tx,
+            tcp_writers: HashMap::new(),
+            next_conn: 1,
             next_index: 1,
             pending_stun: None,
         }
@@ -175,9 +207,9 @@ impl Engine {
                         Ok((n, src)) => self.on_udp(&udp_buf[..n], src).await,
                         // Windows surfaces ICMP port-unreachable as a recv error
                         // (WSAECONNRESET); normal during punching, not fatal.
+                        // Do NOT sleep here: it would stall the whole event loop.
                         Err(e) => {
                             tracing::debug!("udp recv: {e}");
-                            tokio::time::sleep(Duration::from_millis(100)).await;
                         }
                     }
                 }
@@ -222,9 +254,6 @@ impl Engine {
                     self.vip_to_key.remove(&p.virtual_ip);
                 }
             }
-            Command::UpdateCandidates { public_key, candidates } => {
-                self.update_candidates(&public_key, candidates);
-            }
             Command::Stun { server, reply } => {
                 let mut txid = [0u8; 12];
                 rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut txid);
@@ -239,12 +268,29 @@ impl Engine {
             Command::RelayIn(data) => {
                 self.ingest(&data, None).await;
             }
+            Command::TcpUp { key, stream } => {
+                self.attach_tcp(&key, stream, true).await;
+            }
+            Command::TcpAccepted(stream) => {
+                self.attach_tcp("", stream, false).await;
+            }
+            Command::TcpIn { conn, key, data } => {
+                self.ingest_tcp(&data, key, conn).await;
+            }
+            Command::TcpClosed(conn) => {
+                self.tcp_writers.remove(&conn);
+                for p in self.peers.values_mut() {
+                    if p.tcp_tx.as_ref().is_some_and(|tx| tx.is_closed()) {
+                        p.tcp_tx = None;
+                    }
+                }
+            }
         }
     }
 
     async fn upsert_peer(&mut self, info: PeerInfo) {
         if self.peers.contains_key(&info.public_key) {
-            self.update_candidates(&info.public_key, info.candidates);
+            self.update_candidates(&info.public_key, info.candidates, info.tcp);
             return;
         }
         let Ok(key) = decode_key(&info.public_key) else {
@@ -273,6 +319,9 @@ impl Engine {
             key_bytes: *key.as_bytes(),
             virtual_ip: info.virtual_ip,
             candidates: info.candidates,
+            tcp: info.tcp,
+            tcp_tx: None,
+            last_tcp_try: Instant::now() - Duration::from_secs(10),
             endpoint: None,
             last_punch: Instant::now() - PUNCH_INTERVAL,
             created: Instant::now(),
@@ -283,10 +332,95 @@ impl Engine {
         self.peers.insert(info.public_key, peer);
     }
 
-    fn update_candidates(&mut self, key: &str, candidates: Vec<SocketAddr>) {
+    fn update_candidates(&mut self, key: &str, candidates: Vec<SocketAddr>, tcp: Vec<SocketAddr>) {
         if let Some(p) = self.peers.get_mut(key) {
             p.candidates = candidates;
+            p.tcp = tcp;
             p.last_punch = Instant::now() - PUNCH_INTERVAL;
+        }
+    }
+
+    /// Wire a TCP stream as a transport: reader feeds TcpIn, writer drains a channel.
+    async fn attach_tcp(&mut self, key: &str, stream: tokio::net::TcpStream, outbound: bool) {
+        let _ = stream.set_nodelay(true);
+        let conn = self.next_conn;
+        self.next_conn += 1;
+        let (mut rd, mut wr) = stream.into_split();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
+        let cmd_tx = self.cmd_sender();
+        let hint = if outbound { Some(key.to_string()) } else { None };
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut lenbuf = [0u8; 2];
+            loop {
+                if rd.read_exact(&mut lenbuf).await.is_err() {
+                    break;
+                }
+                let n = u16::from_be_bytes(lenbuf) as usize;
+                if n == 0 || n > BUF {
+                    break;
+                }
+                let mut data = vec![0u8; n];
+                if rd.read_exact(&mut data).await.is_err() {
+                    break;
+                }
+                if cmd_tx.send(Command::TcpIn { conn, key: hint.clone(), data }).await.is_err() {
+                    break;
+                }
+            }
+            let _ = cmd_tx.send(Command::TcpClosed(conn)).await;
+        });
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            while let Some(data) = rx.recv().await {
+                let len = (data.len() as u16).to_be_bytes();
+                if wr.write_all(&len).await.is_err() || wr.write_all(&data).await.is_err() {
+                    break;
+                }
+            }
+        });
+        if outbound {
+            if let Some(p) = self.peers.get_mut(key) {
+                p.tcp_tx = Some(tx);
+                p.use_relay = false;
+                tracing::info!("peer {} direct TCP established", p.virtual_ip);
+            }
+        } else {
+            self.tcp_writers.insert(conn, tx);
+        }
+    }
+
+    fn cmd_sender(&self) -> mpsc::Sender<Command> {
+        self.cmd_tx.clone()
+    }
+
+    async fn ingest_tcp(&mut self, data: &[u8], hint: Option<String>, conn: u64) {
+        let keys: Vec<String> = match hint {
+            Some(k) => vec![k],
+            None => self.peers.keys().cloned().collect(),
+        };
+        for key in keys {
+            let act = {
+                let Some(peer) = self.peers.get_mut(&key) else { continue };
+                let mut dst_buf = [0u8; BUF];
+                let res = peer.tunn.decapsulate(None, data, &mut dst_buf);
+                match res {
+                    TunnResult::Err(_) => continue,
+                    other => action(other),
+                }
+            };
+            if let Some(peer) = self.peers.get_mut(&key) {
+                if peer.tcp_tx.is_none() {
+                    if let Some(tx) = self.tcp_writers.remove(&conn) {
+                        peer.tcp_tx = Some(tx);
+                        peer.use_relay = false;
+                        tracing::info!("peer {} direct TCP (inbound) established", peer.virtual_ip);
+                    }
+                }
+                apply(&self.socket, &self.ip_in, &self.relay_out, peer, act).await;
+            }
+            self.drain(&key).await;
+            return;
         }
     }
 
@@ -383,13 +517,36 @@ impl Engine {
         for key in keys {
             let (act, punch_due) = {
                 let peer = self.peers.get_mut(&key).unwrap();
-                // No direct UDP path for a while -> fall back to server relay.
+                // No direct UDP path for a while -> prefer direct TCP, else relay.
                 if !peer.use_relay
+                    && peer.tcp_tx.is_none()
                     && now.duration_since(peer.created) > Duration::from_secs(8)
                     && now.duration_since(peer.last_direct) > Duration::from_secs(10)
                 {
                     peer.use_relay = true;
                     tracing::info!("peer {} via server relay (no direct path)", peer.virtual_ip);
+                }
+                // Attempt direct TCP when UDP is dead and we have TCP endpoints.
+                if TCP_DIRECT
+                    && peer.tcp_tx.is_none()
+                    && !peer.tcp.is_empty()
+                    && now.duration_since(peer.last_direct) > Duration::from_secs(5)
+                    && now.duration_since(peer.last_tcp_try) > Duration::from_secs(5)
+                {
+                    peer.last_tcp_try = now;
+                    let tcp = peer.tcp.clone();
+                    let key = key.clone();
+                    let tx = self.cmd_tx.clone();
+                    tokio::spawn(async move {
+                        for addr in tcp {
+                            if let Ok(Ok(stream)) =
+                                tokio::time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect(addr)).await
+                            {
+                                let _ = tx.send(Command::TcpUp { key, stream }).await;
+                                return;
+                            }
+                        }
+                    });
                 }
                 let mut dst_buf = [0u8; BUF];
                 let res = peer.tunn.update_timers(&mut dst_buf);

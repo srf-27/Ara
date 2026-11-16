@@ -36,6 +36,7 @@ async fn start_client(server_port: u16, tag: &str) -> Client {
         server_host: "127.0.0.1".into(),
         server_port,
         local_port: 0,
+        tcp_port: 0,
         identity_path: Some(std::env::temp_dir().join(format!("ara-test-{tag}.key"))),
     };
     let (to_engine, engine_out) = mpsc::channel(256);
@@ -144,6 +145,7 @@ async fn relay_routes_binary_frames() {
             secret: "s".into(),
             public_key: b64.encode(key),
             candidates: vec![],
+            tcp: vec![],
         })
     };
 

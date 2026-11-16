@@ -74,17 +74,38 @@ pub async fn run(
     let public_key = encode_key(&PublicKey::from(&secret));
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
     let (relay_tx, mut relay_rx) = mpsc::channel::<Vec<u8>>(256);
-    let engine = Engine::new(socket.clone(), secret, ip_out, ip_in, relay_tx, cmd_rx);
+    let engine = Engine::new(socket.clone(), secret, ip_out, ip_in, relay_tx, cmd_rx, cmd_tx.clone());
     tokio::spawn(async move {
         if let Err(e) = engine.run().await {
             tracing::error!("data plane stopped: {e}");
         }
     });
 
+    // Direct-TCP fallback listener.
+    let tcp_port = cfg.tcp_port;
+    match tokio::net::TcpListener::bind(("0.0.0.0", tcp_port)).await {
+        Ok(listener) => {
+            let tx = cmd_tx.clone();
+            tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, _)) => {
+                            if tx.send(Command::TcpAccepted(stream)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+        Err(e) => tracing::warn!("TCP fallback listener on {tcp_port}: {e}"),
+    }
+
     let mut assigned = Some(assigned);
     let mut backoff = Duration::from_secs(1);
     loop {
-        match session(&cfg, local_port, &public_key, &cmd_tx, &mut relay_rx, &mut assigned).await {
+        match session(&cfg, local_port, tcp_port, &public_key, &cmd_tx, &mut relay_rx, &mut assigned).await {
             Ok(()) => tracing::info!("signaling closed, reconnecting"),
             Err(e) if e.is::<FatalAuth>() => {
                 tracing::error!("{e}");
@@ -100,6 +121,7 @@ pub async fn run(
 async fn session(
     cfg: &ResolvedConfig,
     local_port: u16,
+    tcp_port: u16,
     public_key: &str,
     cmd_tx: &mpsc::Sender<Command>,
     relay_rx: &mut mpsc::Receiver<Vec<u8>>,
@@ -124,6 +146,7 @@ async fn session(
         secret: cfg.secret.clone(),
         public_key: public_key.to_string(),
         candidates: local_candidates(local_port),
+        tcp: tcp_candidates(tcp_port, None),
     };
     sink.send(WsMessage::Text(proto::encode(&register))).await?;
 
@@ -169,6 +192,7 @@ async fn session(
     }
     sink.send(WsMessage::Text(proto::encode(&Message::Candidates {
         candidates: candidates.clone(),
+        tcp: tcp_candidates(tcp_port, reflexive),
     })))
     .await?;
 
@@ -217,9 +241,26 @@ async fn session(
                     candidates = now;
                     sink.send(WsMessage::Text(proto::encode(&Message::Candidates {
                         candidates: candidates.clone(),
+                        tcp: tcp_candidates(tcp_port, reflexive),
                     }))).await?;
                 }
             }
         }
     }
+}
+
+/// TCP endpoints for the direct-TCP fallback: local interfaces plus the
+/// STUN-reflexive IP (cloud NAT usually preserves the TCP port).
+fn tcp_candidates(tcp_port: u16, reflexive: Option<SocketAddr>) -> Vec<SocketAddr> {
+    let mut out: Vec<SocketAddr> = local_candidates(0)
+        .into_iter()
+        .map(|a| SocketAddr::new(a.ip(), tcp_port))
+        .collect();
+    if let Some(r) = reflexive {
+        let a = SocketAddr::new(r.ip(), tcp_port);
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    out
 }

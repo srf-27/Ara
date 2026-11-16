@@ -7,6 +7,9 @@ pub struct PeerInfo {
     pub public_key: String,
     pub virtual_ip: Ipv4Addr,
     pub candidates: Vec<SocketAddr>,
+    /// Reachable TCP endpoints for the direct-TCP fallback transport.
+    #[serde(default)]
+    pub tcp: Vec<SocketAddr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -17,6 +20,8 @@ pub enum Message {
         secret: String,
         public_key: String,
         candidates: Vec<SocketAddr>,
+        #[serde(default)]
+        tcp: Vec<SocketAddr>,
     },
     Welcome {
         virtual_ip: Ipv4Addr,
@@ -27,6 +32,8 @@ pub enum Message {
     },
     Candidates {
         candidates: Vec<SocketAddr>,
+        #[serde(default)]
+        tcp: Vec<SocketAddr>,
     },
     Error {
         reason: String,
@@ -54,13 +61,14 @@ mod tests {
                 secret: "s".into(),
                 public_key: "k".into(),
                 candidates: vec!["1.2.3.4:5".parse().unwrap()],
+                tcp: vec![],
             },
             Message::Welcome {
                 virtual_ip: Ipv4Addr::new(10, 99, 0, 2),
                 prefix: 24,
             },
             Message::Peers { peers: vec![] },
-            Message::Candidates { candidates: vec![] },
+            Message::Candidates { candidates: vec![], tcp: vec![] },
             Message::Error { reason: "bad secret".into() },
             Message::Heartbeat,
         ];

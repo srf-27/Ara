@@ -43,11 +43,16 @@ impl ClientConfig {
         if network.is_empty() || secret.is_empty() {
             bail!("network and secret must not be empty");
         }
+        let (server_host, server_port) = match server.rsplit_once(':') {
+            Some((h, p)) => (h.to_string(), p.parse().context("server port")?),
+            None => (server.clone(), DEFAULT_PORT),
+        };
         Ok(ResolvedConfig {
             network,
             secret,
-            server,
-            port: self.port.unwrap_or(DEFAULT_PORT),
+            server_host,
+            server_port,
+            local_port: self.port.unwrap_or(DEFAULT_PORT),
         })
     }
 }
@@ -56,9 +61,10 @@ impl ClientConfig {
 pub struct ResolvedConfig {
     pub network: String,
     pub secret: String,
-    /// Server host or IP, without scheme/port.
-    pub server: String,
-    pub port: u16,
+    pub server_host: String,
+    pub server_port: u16,
+    /// Local UDP port shared by STUN and WireGuard; 0 = ephemeral.
+    pub local_port: u16,
 }
 
 #[cfg(test)]
@@ -77,7 +83,22 @@ mod tests {
         let r = merged.validate().unwrap();
         assert_eq!(r.network, "cli-net");
         assert_eq!(r.secret, "file-secret");
-        assert_eq!(r.port, 2);
+        assert_eq!(r.local_port, 2);
+        assert_eq!(r.server_host, "1.1.1.1");
+        assert_eq!(r.server_port, DEFAULT_PORT);
+    }
+
+    #[test]
+    fn server_host_port_split() {
+        let c = ClientConfig {
+            network: Some("n".into()),
+            secret: Some("s".into()),
+            server: Some("example.com:9999".into()),
+            port: None,
+        };
+        let r = c.validate().unwrap();
+        assert_eq!(r.server_host, "example.com");
+        assert_eq!(r.server_port, 9999);
     }
 
     #[test]
@@ -93,6 +114,6 @@ mod tests {
             server: Some("h".into()),
             port: None,
         };
-        assert_eq!(c.validate().unwrap().port, DEFAULT_PORT);
+        assert_eq!(c.validate().unwrap().local_port, DEFAULT_PORT);
     }
 }

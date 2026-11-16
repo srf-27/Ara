@@ -12,6 +12,7 @@ pub struct ClientConfig {
     pub secret: Option<String>,
     pub server: Option<String>,
     pub port: Option<u16>,
+    pub identity: Option<std::path::PathBuf>,
 }
 
 impl ClientConfig {
@@ -28,11 +29,13 @@ impl ClientConfig {
         secret: Option<String>,
         server: Option<String>,
         port: Option<u16>,
+        identity: Option<std::path::PathBuf>,
     ) -> Self {
         self.network = network.or(self.network);
         self.secret = secret.or(self.secret);
         self.server = server.or(self.server);
         self.port = port.or(self.port);
+        self.identity = identity.or(self.identity);
         self
     }
 
@@ -53,6 +56,7 @@ impl ClientConfig {
             server_host,
             server_port,
             local_port: self.port.unwrap_or(DEFAULT_PORT),
+            identity_path: self.identity,
         })
     }
 }
@@ -65,6 +69,8 @@ pub struct ResolvedConfig {
     pub server_port: u16,
     /// Local UDP port shared by STUN and WireGuard; 0 = ephemeral.
     pub local_port: u16,
+    /// Override identity key file (default: per-user platform path).
+    pub identity_path: Option<std::path::PathBuf>,
 }
 
 #[cfg(test)]
@@ -78,8 +84,9 @@ mod tests {
             secret: Some("file-secret".into()),
             server: Some("1.1.1.1".into()),
             port: Some(1),
+            identity: None,
         };
-        let merged = file.merge_cli(Some("cli-net".into()), None, None, Some(2));
+        let merged = file.merge_cli(Some("cli-net".into()), None, None, Some(2), None);
         let r = merged.validate().unwrap();
         assert_eq!(r.network, "cli-net");
         assert_eq!(r.secret, "file-secret");
@@ -95,6 +102,7 @@ mod tests {
             secret: Some("s".into()),
             server: Some("example.com:9999".into()),
             port: None,
+            identity: None,
         };
         let r = c.validate().unwrap();
         assert_eq!(r.server_host, "example.com");
@@ -113,6 +121,7 @@ mod tests {
             secret: Some("s".into()),
             server: Some("h".into()),
             port: None,
+            identity: None,
         };
         assert_eq!(c.validate().unwrap().local_port, DEFAULT_PORT);
     }

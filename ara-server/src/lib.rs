@@ -22,6 +22,7 @@ pub struct State {
 struct Network {
     secret: String,
     peers: HashMap<String, Peer>,
+    allocated: HashMap<String, Ipv4Addr>,
     next_host: u16,
 }
 
@@ -50,29 +51,30 @@ impl State {
             .or_insert_with(|| Network {
                 secret: secret.to_string(),
                 peers: HashMap::new(),
-                next_host: 2,
+                allocated: HashMap::new(),
+                next_host: 1,
             });
         if net.secret != secret {
             return Err("wrong network secret".into());
         }
-        let vip = if let Some(p) = net.peers.get_mut(public_key) {
-            p.candidates = candidates;
-            p.last_seen = Instant::now();
-            p.virtual_ip
-        } else {
-            if net.next_host > 254 {
-                return Err("network full (253 peers)".into());
+        let vip = match net.allocated.get(public_key) {
+            Some(vip) => *vip,
+            None => {
+                if net.next_host > 254 {
+                    return Err("network full (254 peers)".into());
+                }
+                let mut o = VIRTUAL_SUBNET.octets();
+                o[3] = net.next_host as u8;
+                net.next_host += 1;
+                let vip = Ipv4Addr::from(o);
+                net.allocated.insert(public_key.to_string(), vip);
+                vip
             }
-            let mut o = VIRTUAL_SUBNET.octets();
-            o[3] = net.next_host as u8;
-            net.next_host += 1;
-            let vip = Ipv4Addr::from(o);
-            net.peers.insert(
-                public_key.to_string(),
-                Peer { virtual_ip: vip, candidates, last_seen: Instant::now() },
-            );
-            vip
         };
+        net.peers.insert(
+            public_key.to_string(),
+            Peer { virtual_ip: vip, candidates, last_seen: Instant::now() },
+        );
         Ok(vip)
     }
 
@@ -135,17 +137,74 @@ impl State {
     pub fn prefix(&self) -> u8 {
         VIRTUAL_PREFIX
     }
+
+    /// Re-insert a persisted allocation (survives server restarts).
+    pub fn restore(&mut self, network: &str, secret: &str, public_key: &str, vip: Ipv4Addr) {
+        let net = self
+            .networks
+            .entry(network.to_string())
+            .or_insert_with(|| Network {
+                secret: secret.to_string(),
+                peers: HashMap::new(),
+                allocated: HashMap::new(),
+                next_host: 1,
+            });
+        let host = vip.octets()[3] as u16;
+        if host >= net.next_host {
+            net.next_host = host + 1;
+        }
+        net.allocated.insert(public_key.to_string(), vip);
+    }
+
+    pub fn allocations(&self) -> Vec<Alloc> {
+        let mut out = Vec::new();
+        for (name, net) in &self.networks {
+            for (key, vip) in &net.allocated {
+                out.push(Alloc {
+                    network: name.clone(),
+                    secret: net.secret.clone(),
+                    public_key: key.clone(),
+                    virtual_ip: *vip,
+                });
+            }
+        }
+        out
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Alloc {
+    pub network: String,
+    pub secret: String,
+    pub public_key: String,
+    pub virtual_ip: Ipv4Addr,
 }
 
 type Bcast = broadcast::Sender<(String, String)>;
 
-/// Run the control plane on an already-bound TCP listener and UDP socket.
-pub async fn serve(listener: TcpListener, udp: Arc<UdpSocket>) -> Result<()> {
+/// Run the control plane on an already-bound TCP listener and optional UDP
+/// socket (None = TCP-only signaling, clients use public STUN).
+/// `state_path` persists virtual-IP allocations across restarts.
+pub async fn serve(
+    listener: TcpListener,
+    udp: Option<Arc<UdpSocket>>,
+    state_path: Option<std::path::PathBuf>,
+) -> Result<()> {
     let state = Arc::new(Mutex::new(State::new()));
+    if let Some(path) = &state_path {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(allocs) = serde_json::from_str::<Vec<Alloc>>(&text) {
+                let mut st = state.lock().await;
+                for a in allocs {
+                    st.restore(&a.network, &a.secret, &a.public_key, a.virtual_ip);
+                }
+            }
+        }
+    }
     let (bcast, _) = broadcast::channel::<(String, String)>(256);
+    let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
 
-    {
-        let udp = udp.clone();
+    if let Some(udp) = udp {
         tokio::spawn(async move {
             let mut buf = [0u8; 2048];
             loop {
@@ -183,18 +242,32 @@ pub async fn serve(listener: TcpListener, udp: Arc<UdpSocket>) -> Result<()> {
 
     loop {
         let (stream, addr) = listener.accept().await?;
+        let _ = stream.set_nodelay(true);
         let state = state.clone();
         let bcast = bcast.clone();
+        let registry = registry.clone();
+        let state_path = state_path.clone();
         tokio::spawn(async move {
             match tokio_tungstenite::accept_async(stream).await {
                 Ok(ws) => {
-                    if let Err(e) = handle_conn(ws, state, bcast).await {
+                    if let Err(e) = handle_conn(ws, state, bcast, registry, state_path).await {
                         tracing::debug!("conn {addr} ended: {e}");
                     }
                 }
                 Err(e) => tracing::debug!("ws handshake {addr}: {e}"),
             }
         });
+    }
+}
+
+type Registry = Arc<Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>;
+
+async fn save_state(state: &Arc<Mutex<State>>, path: &Option<std::path::PathBuf>) {
+    if let Some(path) = path {
+        let allocs = state.lock().await.allocations();
+        if let Ok(json) = serde_json::to_string(&allocs) {
+            let _ = std::fs::write(path, json);
+        }
     }
 }
 
@@ -208,6 +281,8 @@ async fn handle_conn(
     ws: WebSocketStream<tokio::net::TcpStream>,
     state: Arc<Mutex<State>>,
     bcast: Bcast,
+    registry: Registry,
+    state_path: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let (mut sink, mut stream) = ws.split();
 
@@ -249,6 +324,9 @@ async fn handle_conn(
     })))
     .await?;
     broadcast_peers(&state, &bcast, &network).await;
+    save_state(&state, &state_path).await;
+    let (relay_tx, mut relay_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    registry.lock().await.insert(public_key.clone(), relay_tx);
     tracing::info!("peer {public_key} joined {network} as {vip}");
 
     let result = loop {
@@ -265,11 +343,24 @@ async fn handle_conn(
                         }
                         _ => {}
                     },
+                    Some(Ok(WsMessage::Binary(b))) => {
+                        // Relay frame: [32-byte dest public key][WG packet].
+                        if b.len() > 32 {
+                            use base64::Engine as _;
+                            let dest = base64::engine::general_purpose::STANDARD.encode(&b[..32]);
+                            if let Some(tx) = registry.lock().await.get(&dest) {
+                                let _ = tx.send(b[32..].to_vec());
+                            }
+                        }
+                    }
                     Some(Ok(WsMessage::Ping(p))) => { let _ = sink.send(WsMessage::Pong(p)).await; }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => break Err(anyhow::anyhow!(e)),
                     None => break Ok(()),
                 }
+            }
+            Some(bytes) = relay_rx.recv() => {
+                if sink.send(WsMessage::Binary(bytes)).await.is_err() { break Ok(()); }
             }
             b = rx.recv() => {
                 match b {
@@ -284,8 +375,10 @@ async fn handle_conn(
         }
     };
 
+    registry.lock().await.remove(&public_key);
     state.lock().await.remove(&network, &public_key);
     broadcast_peers(&state, &bcast, &network).await;
+    save_state(&state, &state_path).await;
     tracing::info!("peer {public_key} left {network}");
     result
 }
@@ -303,8 +396,8 @@ mod tests {
         let mut s = State::new();
         let a = s.register("n", "sec", "keyA", cands()).unwrap();
         let b = s.register("n", "sec", "keyB", cands()).unwrap();
-        assert_eq!(a, Ipv4Addr::new(10, 99, 0, 2));
-        assert_eq!(b, Ipv4Addr::new(10, 99, 0, 3));
+        assert_eq!(a, Ipv4Addr::new(10, 99, 0, 1));
+        assert_eq!(b, Ipv4Addr::new(10, 99, 0, 2));
         // re-register A keeps its IP
         let a2 = s.register("n", "sec", "keyA", cands()).unwrap();
         assert_eq!(a, a2);

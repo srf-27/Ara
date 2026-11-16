@@ -23,3 +23,6 @@ socket2 = "0.5"
 
 [dev-dependencies]
 ara-server = { path = "../ara-server" }
+base64 = "0.22"
+tokio-tungstenite.workspace = true
+futures-util.workspace = true

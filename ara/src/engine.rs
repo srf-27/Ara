@@ -36,9 +36,13 @@ pub fn decode_key(s: &str) -> Result<PublicKey> {
 
 pub enum Command {
     AddPeer(PeerInfo),
+    /// Reconcile the peer table to exactly this list (drops stale peers).
+    SetPeers(Vec<PeerInfo>),
     RemovePeer(String),
     UpdateCandidates { public_key: String, candidates: Vec<SocketAddr> },
     Stun { server: SocketAddr, reply: oneshot::Sender<Option<SocketAddr>> },
+    /// WG datagram arrived via the server relay (TCP), not UDP.
+    RelayIn(Vec<u8>),
 }
 
 /// Owned copy of a TunnResult so we can release the peer borrow before doing IO.
@@ -67,9 +71,21 @@ fn target(addr: SocketAddr) -> SocketAddr {
     }
 }
 
-async fn apply(socket: &UdpSocket, ip_in: &mpsc::Sender<Vec<u8>>, peer: &Peer, act: Action) {
+async fn apply(
+    socket: &UdpSocket,
+    ip_in: &mpsc::Sender<Vec<u8>>,
+    relay_out: &mpsc::Sender<Vec<u8>>,
+    peer: &Peer,
+    act: Action,
+) {
     match act {
         Action::Send(bytes) => {
+            if peer.use_relay {
+                let mut frame = peer.key_bytes.to_vec();
+                frame.extend_from_slice(&bytes);
+                let _ = relay_out.send(frame).await;
+                return;
+            }
             let targets: Vec<SocketAddr> = match peer.endpoint {
                 Some(ep) => vec![ep],
                 None => peer.candidates.clone(),
@@ -79,17 +95,22 @@ async fn apply(socket: &UdpSocket, ip_in: &mpsc::Sender<Vec<u8>>, peer: &Peer, a
             }
         }
         Action::ToTun(bytes) => {
-            let _ = ip_in.try_send(bytes);
+            let _ = ip_in.send(bytes).await;
         }
         Action::None => {}
     }
 }
 
-async fn punch(socket: &UdpSocket, peer: &mut Peer) {
+async fn punch(socket: &UdpSocket, relay_out: &mpsc::Sender<Vec<u8>>, peer: &mut Peer) {
     peer.last_punch = Instant::now();
     let mut dst_buf = [0u8; BUF];
     let res = peer.tunn.format_handshake_initiation(&mut dst_buf, false);
     if let TunnResult::WriteToNetwork(bytes) = res {
+        if peer.use_relay {
+            let mut frame = peer.key_bytes.to_vec();
+            frame.extend_from_slice(bytes);
+            let _ = relay_out.send(frame).await;
+        }
         for c in &peer.candidates {
             let _ = socket.send_to(bytes, target(*c)).await;
         }
@@ -98,10 +119,14 @@ async fn punch(socket: &UdpSocket, peer: &mut Peer) {
 
 struct Peer {
     tunn: Tunn,
+    key_bytes: [u8; 32],
     virtual_ip: Ipv4Addr,
     candidates: Vec<SocketAddr>,
     endpoint: Option<SocketAddr>,
     last_punch: Instant,
+    created: Instant,
+    last_direct: Instant,
+    use_relay: bool,
 }
 
 pub struct Engine {
@@ -111,6 +136,7 @@ pub struct Engine {
     vip_to_key: HashMap<Ipv4Addr, String>,
     ip_out: mpsc::Receiver<Vec<u8>>,
     ip_in: mpsc::Sender<Vec<u8>>,
+    relay_out: mpsc::Sender<Vec<u8>>,
     cmd: mpsc::Receiver<Command>,
     next_index: u32,
     pending_stun: Option<([u8; 12], Instant, oneshot::Sender<Option<SocketAddr>>)>,
@@ -122,6 +148,7 @@ impl Engine {
         secret: StaticSecret,
         ip_out: mpsc::Receiver<Vec<u8>>,
         ip_in: mpsc::Sender<Vec<u8>>,
+        relay_out: mpsc::Sender<Vec<u8>>,
         cmd: mpsc::Receiver<Command>,
     ) -> Self {
         Self {
@@ -131,6 +158,7 @@ impl Engine {
             vip_to_key: HashMap::new(),
             ip_out,
             ip_in,
+            relay_out,
             cmd,
             next_index: 1,
             pending_stun: None,
@@ -143,8 +171,15 @@ impl Engine {
         loop {
             tokio::select! {
                 r = self.socket.recv_from(&mut udp_buf) => {
-                    let (n, src) = r.context("udp recv")?;
-                    self.on_udp(&udp_buf[..n], src).await;
+                    match r {
+                        Ok((n, src)) => self.on_udp(&udp_buf[..n], src).await,
+                        // Windows surfaces ICMP port-unreachable as a recv error
+                        // (WSAECONNRESET); normal during punching, not fatal.
+                        Err(e) => {
+                            tracing::debug!("udp recv: {e}");
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
                 }
                 Some(packet) = self.ip_out.recv() => {
                     self.on_ip_out(&packet).await;
@@ -162,40 +197,25 @@ impl Engine {
     async fn on_command(&mut self, cmd: Command) {
         match cmd {
             Command::AddPeer(info) => {
-                if self.peers.contains_key(&info.public_key) {
-                    self.update_candidates(&info.public_key, info.candidates);
-                    return;
-                }
-                let Ok(key) = decode_key(&info.public_key) else {
-                    tracing::warn!("bad peer key {}", info.public_key);
-                    return;
-                };
-                let tunn = match Tunn::new(
-                    self.secret.clone(),
-                    key,
-                    None,
-                    Some(KEEPALIVE_SECS),
-                    self.next_index,
-                    None,
-                ) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::warn!("tunnel init: {e}");
-                        return;
+                self.upsert_peer(info).await;
+            }
+            Command::SetPeers(list) => {
+                let keep: std::collections::HashSet<String> =
+                    list.iter().map(|p| p.public_key.clone()).collect();
+                let stale: Vec<String> = self
+                    .peers
+                    .keys()
+                    .filter(|k| !keep.contains(*k))
+                    .cloned()
+                    .collect();
+                for k in stale {
+                    if let Some(p) = self.peers.remove(&k) {
+                        self.vip_to_key.remove(&p.virtual_ip);
                     }
-                };
-                self.next_index += 1;
-                self.vip_to_key.insert(info.virtual_ip, info.public_key.clone());
-                tracing::debug!("add peer {} vip {} candidates {:?}", info.public_key, info.virtual_ip, info.candidates);
-                let mut peer = Peer {
-                    tunn,
-                    virtual_ip: info.virtual_ip,
-                    candidates: info.candidates,
-                    endpoint: None,
-                    last_punch: Instant::now() - PUNCH_INTERVAL,
-                };
-                punch(&self.socket, &mut peer).await;
-                self.peers.insert(info.public_key, peer);
+                }
+                for info in list {
+                    self.upsert_peer(info).await;
+                }
             }
             Command::RemovePeer(key) => {
                 if let Some(p) = self.peers.remove(&key) {
@@ -216,7 +236,51 @@ impl Engine {
                     let _ = reply.send(None);
                 }
             }
+            Command::RelayIn(data) => {
+                self.ingest(&data, None).await;
+            }
         }
+    }
+
+    async fn upsert_peer(&mut self, info: PeerInfo) {
+        if self.peers.contains_key(&info.public_key) {
+            self.update_candidates(&info.public_key, info.candidates);
+            return;
+        }
+        let Ok(key) = decode_key(&info.public_key) else {
+            tracing::warn!("bad peer key {}", info.public_key);
+            return;
+        };
+        let tunn = match Tunn::new(
+            self.secret.clone(),
+            key,
+            None,
+            Some(KEEPALIVE_SECS),
+            self.next_index,
+            None,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("tunnel init: {e}");
+                return;
+            }
+        };
+        self.next_index += 1;
+        self.vip_to_key.insert(info.virtual_ip, info.public_key.clone());
+        tracing::debug!("add peer {} vip {} candidates {:?}", info.public_key, info.virtual_ip, info.candidates);
+        let mut peer = Peer {
+            tunn,
+            key_bytes: *key.as_bytes(),
+            virtual_ip: info.virtual_ip,
+            candidates: info.candidates,
+            endpoint: None,
+            last_punch: Instant::now() - PUNCH_INTERVAL,
+            created: Instant::now(),
+            last_direct: Instant::now() - Duration::from_secs(10),
+            use_relay: false,
+        };
+        punch(&self.socket, &self.relay_out, &mut peer).await;
+        self.peers.insert(info.public_key, peer);
     }
 
     fn update_candidates(&mut self, key: &str, candidates: Vec<SocketAddr>) {
@@ -241,7 +305,7 @@ impl Engine {
             action(res)
         };
         if let Some(peer) = self.peers.get(&key) {
-            apply(&self.socket, &self.ip_in, peer, act).await;
+            apply(&self.socket, &self.ip_in, &self.relay_out, peer, act).await;
         }
     }
 
@@ -257,20 +321,32 @@ impl Engine {
                 }
             }
         }
+        self.ingest(datagram, Some(src)).await;
+    }
+
+    /// Feed a WG datagram (from UDP or relay) to whichever peer accepts it.
+    async fn ingest(&mut self, datagram: &[u8], src: Option<SocketAddr>) {
         let keys: Vec<String> = self.peers.keys().cloned().collect();
         for key in keys {
             let act = {
                 let peer = self.peers.get_mut(&key).unwrap();
                 let mut dst_buf = [0u8; BUF];
-                let res = peer.tunn.decapsulate(Some(src.ip()), datagram, &mut dst_buf);
+                let res = peer.tunn.decapsulate(src.map(|s| s.ip()), datagram, &mut dst_buf);
                 match res {
                     TunnResult::Err(_) => continue,
                     other => action(other),
                 }
             };
             if let Some(peer) = self.peers.get_mut(&key) {
-                peer.endpoint = Some(src);
-                apply(&self.socket, &self.ip_in, peer, act).await;
+                if let Some(src) = src {
+                    peer.endpoint = Some(src);
+                    peer.last_direct = Instant::now();
+                    if peer.use_relay {
+                        tracing::info!("peer {} direct path restored", peer.virtual_ip);
+                    }
+                    peer.use_relay = false;
+                }
+                apply(&self.socket, &self.ip_in, &self.relay_out, peer, act).await;
             }
             self.drain(&key).await;
             return;
@@ -289,7 +365,7 @@ impl Engine {
                 }
             };
             if let Some(peer) = self.peers.get(key) {
-                apply(&self.socket, &self.ip_in, peer, act).await;
+                apply(&self.socket, &self.ip_in, &self.relay_out, peer, act).await;
             }
         }
     }
@@ -307,6 +383,14 @@ impl Engine {
         for key in keys {
             let (act, punch_due) = {
                 let peer = self.peers.get_mut(&key).unwrap();
+                // No direct UDP path for a while -> fall back to server relay.
+                if !peer.use_relay
+                    && now.duration_since(peer.created) > Duration::from_secs(8)
+                    && now.duration_since(peer.last_direct) > Duration::from_secs(10)
+                {
+                    peer.use_relay = true;
+                    tracing::info!("peer {} via server relay (no direct path)", peer.virtual_ip);
+                }
                 let mut dst_buf = [0u8; BUF];
                 let res = peer.tunn.update_timers(&mut dst_buf);
                 let stale = peer
@@ -316,11 +400,11 @@ impl Engine {
                 (action(res), stale && now.duration_since(peer.last_punch) > PUNCH_INTERVAL)
             };
             if let Some(peer) = self.peers.get(&key) {
-                apply(&self.socket, &self.ip_in, peer, act).await;
+                apply(&self.socket, &self.ip_in, &self.relay_out, peer, act).await;
             }
             if punch_due {
                 let peer = self.peers.get_mut(&key).unwrap();
-                punch(&self.socket, peer).await;
+                punch(&self.socket, &self.relay_out, peer).await;
             }
         }
     }

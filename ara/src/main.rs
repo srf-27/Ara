@@ -32,6 +32,9 @@ enum Command {
         /// Local UDP port shared by STUN and WireGuard (0 = ephemeral).
         #[arg(long)]
         port: Option<u16>,
+        /// Identity key file override (default: per-user platform path).
+        #[arg(long)]
+        identity: Option<PathBuf>,
     },
 }
 
@@ -44,7 +47,7 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
-    let Command::Up { config, network, secret, server, port } = cli.command;
+    let Command::Up { config, network, secret, server, port, identity } = cli.command;
 
     let file_cfg = match config {
         Some(path) => ClientConfig::from_file(&path)?,
@@ -57,7 +60,7 @@ async fn main() -> Result<()> {
             }
         }
     };
-    let cfg = file_cfg.merge_cli(network, secret, server, port).validate()?;
+    let cfg = file_cfg.merge_cli(network, secret, server, port, identity).validate()?;
 
     let (from_tun_tx, from_tun_rx) = mpsc::channel::<Vec<u8>>(256);
     let (to_tun_tx, mut to_tun_rx) = mpsc::channel::<Vec<u8>>(256);

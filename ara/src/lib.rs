@@ -13,4 +13,4 @@ pub const VIRTUAL_PREFIX: u8 = 24;
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 15;
 pub const OFFLINE_AFTER_SECS: u64 = 45;
 pub const KEEPALIVE_SECS: u16 = 25;
-pub const TUN_MTU: u16 = 1400;
+pub const TUN_MTU: u16 = 1280;

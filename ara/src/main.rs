@@ -69,6 +69,9 @@ async fn main() -> Result<()> {
         .await
         .context("failed to join network (wrong secret, or client exited; see logs)")?;
 
+    #[cfg(target_os = "windows")]
+    ensure_wintun().context("prepare wintun.dll")?;
+
     let mut config = tun::configure();
     config
         .name("ara")
@@ -118,4 +121,17 @@ async fn main() -> Result<()> {
 fn prefix_mask(prefix: u8) -> std::net::Ipv4Addr {
     let mask: u32 = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
     std::net::Ipv4Addr::from(mask)
+}
+
+/// The wintun crate loads wintun.dll from the exe directory; embed the official
+/// signed DLL and extract it on first run so the binary is self-contained.
+#[cfg(target_os = "windows")]
+fn ensure_wintun() -> Result<()> {
+    const DLL: &[u8] = include_bytes!("../vendor/wintun.dll");
+    let exe = std::env::current_exe().context("locate exe")?;
+    let dll = exe.parent().context("exe dir")?.join("wintun.dll");
+    if !dll.exists() {
+        std::fs::write(&dll, DLL).context("extract wintun.dll next to ara.exe")?;
+    }
+    Ok(())
 }

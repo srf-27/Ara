@@ -275,3 +275,186 @@ async fn relay_routes_binary_frames() {
     .expect("relay frame timeout");
     assert_eq!(got, b"relay-payload");
 }
+
+/// Diagnostic: raw ws relay throughput (no engine/WG), isolating the
+/// ws-frame + server-forwarding segment. Sends N frames one-per-message
+/// (as the client session loop does) and times full delivery on loopback.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_throughput_loopback() {
+    use base64::Engine as _;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as Ws;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(ara_server::serve(listener, None, None));
+    let url = format!("ws://127.0.0.1:{port}");
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let reg = |key: [u8; 32]| {
+        ara::proto::encode(&ara::proto::Message::Register {
+            network: "tput-net".into(),
+            secret: "s".into(),
+            public_key: b64.encode(key),
+            candidates: vec![],
+            tcp: vec![],
+        })
+    };
+    let (mut a, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    a.send(Ws::Text(reg([1u8; 32]))).await.unwrap();
+    let _ = a.next().await;
+    let (mut b, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    b.send(Ws::Text(reg([2u8; 32]))).await.unwrap();
+    let _ = b.next().await;
+    let _ = b.next().await;
+
+    const N: u64 = 5000;
+    const SZ: usize = 1300;
+    let mut frame = [2u8; 32].to_vec();
+    frame.extend_from_slice(&vec![0u8; SZ]);
+
+    let start = tokio::time::Instant::now();
+    let sender = tokio::spawn(async move {
+        for _ in 0..N {
+            if a.send(Ws::Binary(frame.clone())).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut got = 0u64;
+    let recv = async {
+        while got < N {
+            match tokio::time::timeout(Duration::from_secs(30), b.next()).await {
+                Ok(Some(Ok(Ws::Binary(_)))) => got += 1,
+                Ok(Some(Ok(_))) => {}
+                _ => break,
+            }
+        }
+    };
+    recv.await;
+    sender.await.unwrap();
+    let elapsed = start.elapsed();
+    let mbps = (got * SZ as u64) as f64 / elapsed.as_secs_f64() / 1e6;
+    eprintln!("relay raw-ws loopback: {got}/{N} frames in {elapsed:?} = {mbps:.2} MB/s");
+    assert_eq!(got, N, "all relay frames must deliver");
+}
+
+/// Diagnostic: full engine+WG relay throughput on loopback. Two engines wired
+/// to a real server via ws, all candidates black-holed so only relay works.
+/// Isolates the engine single-loop segment from the network.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "slow (~13s, 8s relay warmup); on-demand relay throughput diagnostic"]
+async fn engine_relay_throughput_loopback() {
+    use ara::engine::{encode_key, Command, Engine};
+    use ara::proto::PeerInfo;
+    use boringtun::x25519::{PublicKey, StaticSecret};
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio_tungstenite::tungstenite::Message as Ws;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(ara_server::serve(listener, None, None));
+    let url = format!("ws://127.0.0.1:{port}");
+    let blackhole: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+    struct Node {
+        vip: Ipv4Addr,
+        public: PublicKey,
+        to_engine: mpsc::Sender<Vec<u8>>,
+        from_engine: mpsc::Receiver<Vec<u8>>,
+        cmd_tx: mpsc::Sender<Command>,
+    }
+    async fn node(vip: Ipv4Addr, url: &str, blackhole: std::net::SocketAddr) -> Node {
+        let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let public = PublicKey::from(&secret);
+        let socket = Arc::new(bind_udp(0).unwrap());
+        let (to_engine, engine_out) = mpsc::channel(256);
+        let (engine_in, from_engine) = mpsc::channel(4096);
+        let (relay_tx, mut relay_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (cmd_tx, cmd_rx) = mpsc::channel(1024);
+        let engine = Engine::new(socket, secret, engine_out, engine_in, relay_tx, cmd_rx, cmd_tx.clone());
+        tokio::spawn(async move {
+            if let Err(e) = engine.run().await {
+                tracing::error!("engine stopped: {e}");
+            }
+        });
+        let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+        let reg = ara::proto::encode(&ara::proto::Message::Register {
+            network: "tput".into(),
+            secret: "s".into(),
+            public_key: encode_key(&public),
+            candidates: vec![blackhole],
+            tcp: vec![blackhole],
+        });
+        ws.send(Ws::Text(reg)).await.unwrap();
+        let _ = ws.next().await; // welcome
+        let (mut sink, mut stream) = ws.split();
+        tokio::spawn(async move {
+            while let Some(b) = relay_rx.recv().await {
+                if sink.send(Ws::Binary(b)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let tx = cmd_tx.clone();
+        tokio::spawn(async move {
+            while let Some(Ok(msg)) = stream.next().await {
+                if let Ws::Binary(b) = msg {
+                    if tx.send(Command::RelayIn(b)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+        Node { vip, public, to_engine, from_engine, cmd_tx }
+    }
+
+    let a = node(Ipv4Addr::new(10, 99, 0, 1), &url, blackhole).await;
+    let mut b = node(Ipv4Addr::new(10, 99, 0, 2), &url, blackhole).await;
+    a.cmd_tx.send(Command::AddPeer(PeerInfo {
+        public_key: encode_key(&b.public), virtual_ip: b.vip,
+        candidates: vec![blackhole], tcp: vec![blackhole],
+    })).await.unwrap();
+    b.cmd_tx.send(Command::AddPeer(PeerInfo {
+        public_key: encode_key(&a.public), virtual_ip: a.vip,
+        candidates: vec![blackhole], tcp: vec![blackhole],
+    })).await.unwrap();
+
+    let pkt = ip_packet(a.vip, b.vip, &vec![0u8; 1280]);
+    let stop = Arc::new(AtomicBool::new(false));
+    let pumper = tokio::spawn({
+        let tx = a.to_engine.clone();
+        let pkt = pkt.clone();
+        let stop = stop.clone();
+        async move {
+            while !stop.load(Ordering::Relaxed) {
+                if tx.send(pkt.clone()).await.is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
+    });
+
+    // Warmup: relay activates ~8s in, then WG handshake completes over relay.
+    let first = tokio::time::timeout(Duration::from_secs(25), b.from_engine.recv())
+        .await.expect("relay warmup timeout").expect("channel closed");
+    assert_eq!(first, pkt);
+
+    let window = Duration::from_secs(3);
+    let start = tokio::time::Instant::now();
+    let mut bytes = 0u64;
+    let mut count = 0u64;
+    while start.elapsed() < window {
+        let remaining = window - start.elapsed();
+        match tokio::time::timeout(remaining, b.from_engine.recv()).await {
+            Ok(Some(p)) => { bytes += p.len() as u64; count += 1; }
+            _ => break,
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    pumper.await.unwrap();
+    let mbps = bytes as f64 / window.as_secs_f64() / 1e6;
+    eprintln!("relay engine+wg loopback: {count} pkts / {bytes} B in {window:?} = {mbps:.2} MB/s");
+    assert!(count > 0, "relay must deliver in steady state");
+}

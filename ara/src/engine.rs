@@ -26,6 +26,10 @@ const PUNCH_INTERVAL: Duration = Duration::from_secs(2);
 const STUN_TIMEOUT: Duration = Duration::from_secs(3);
 // shortcut: sequential +1..16 only; widen or randomize if real symmetric NATs use larger deltas.
 const PREDICT_SPAN: u16 = 16;
+// shortcut: single-hop UDP relay via one direct peer; upgrade when meshes need multi-hop.
+const PEER_RELAY_MAGIC: &[u8; 4] = b"ARPR";
+const PEER_RELAY_HEADER: usize = 4 + 32;
+const PEER_RELAY_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn encode_key(key: &PublicKey) -> String {
     base64::engine::general_purpose::STANDARD.encode(key.as_bytes())
@@ -98,6 +102,18 @@ fn predict_ports(candidates: &[SocketAddr], span: u16) -> Vec<SocketAddr> {
     out
 }
 
+fn peer_relay_frame(dest: &[u8; 32], wg: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(PEER_RELAY_HEADER + wg.len());
+    frame.extend_from_slice(PEER_RELAY_MAGIC);
+    frame.extend_from_slice(dest);
+    frame.extend_from_slice(wg);
+    frame
+}
+
+fn peer_key(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
 /// Non-blocking TCP send. The engine is a single loop; awaiting a TCP writer
 /// that stalls on a black-holed connection (NAT SYN proxy) would freeze it.
 /// Returns true if the sender accepted the bytes. A dead sender is dropped and
@@ -128,9 +144,20 @@ async fn apply(
         Action::Send(bytes) => {
             // WG type 1 = handshake initiation; spray only while punching so
             // relay/TCP fallback and established paths stay untouched.
-            if peer.symmetric && peer.endpoint.is_none() && !peer.tcp_proven && bytes.first() == Some(&1) {
+            if peer.symmetric && peer.endpoint.is_none() && !peer.tcp_proven && !peer.use_peer_relay
+                && bytes.first() == Some(&1)
+            {
                 for t in predict_ports(&peer.candidates, PREDICT_SPAN) {
                     let _ = socket.send_to(&bytes, target(t)).await;
+                }
+            }
+            if peer.endpoint.is_none() && !peer.tcp_proven {
+                if let Some(via) = peer.via_endpoint {
+                    let frame = peer_relay_frame(&peer.key_bytes, &bytes);
+                    let _ = socket.send_to(&frame, target(via)).await;
+                    if peer.use_peer_relay {
+                        return;
+                    }
                 }
             }
             let direct_recent =
@@ -199,11 +226,15 @@ struct Peer {
     last_direct: Instant,
     use_relay: bool,
     symmetric: bool,
+    via_endpoint: Option<SocketAddr>,
+    use_peer_relay: bool,
+    last_peer_relay: Instant,
 }
 
 pub struct Engine {
     socket: Arc<UdpSocket>,
     secret: StaticSecret,
+    self_key: String,
     peers: HashMap<String, Peer>,
     vip_to_key: HashMap<Ipv4Addr, String>,
     ip_out: mpsc::Receiver<Vec<u8>>,
@@ -227,9 +258,11 @@ impl Engine {
         cmd: mpsc::Receiver<Command>,
         cmd_tx: mpsc::Sender<Command>,
     ) -> Self {
+        let self_key = encode_key(&PublicKey::from(&secret));
         Self {
             socket,
             secret,
+            self_key,
             peers: HashMap::new(),
             vip_to_key: HashMap::new(),
             ip_out,
@@ -313,7 +346,7 @@ impl Engine {
                 }
             }
             Command::RelayIn(data) => {
-                self.ingest(&data, None).await;
+                self.ingest(&data, None, None).await;
             }
             Command::TcpUp { key, stream } => {
                 self.attach_tcp(&key, stream, true).await;
@@ -379,6 +412,9 @@ impl Engine {
             last_direct: Instant::now() - Duration::from_secs(10),
             use_relay: false,
             symmetric: info.symmetric,
+            via_endpoint: None,
+            use_peer_relay: false,
+            last_peer_relay: Instant::now(),
         };
         punch(&self.socket, &self.relay_out, &mut peer).await;
         self.peers.insert(info.public_key, peer);
@@ -536,11 +572,31 @@ impl Engine {
                 }
             }
         }
-        self.ingest(datagram, Some(src)).await;
+        if datagram.starts_with(PEER_RELAY_MAGIC) {
+            self.on_peer_relay(datagram, src).await;
+            return;
+        }
+        self.ingest(datagram, Some(src), None).await;
     }
 
-    /// Feed a WG datagram (from UDP or relay) to whichever peer accepts it.
-    async fn ingest(&mut self, datagram: &[u8], src: Option<SocketAddr>) {
+    /// One-hop peer relay: forward the encrypted WG packet to the destination
+    /// peer we can reach directly, or decapsulate it when addressed to us.
+    async fn on_peer_relay(&mut self, frame: &[u8], src: SocketAddr) {
+        if frame.len() <= PEER_RELAY_HEADER {
+            return;
+        }
+        let dest = peer_key(&frame[4..36]);
+        if dest == self.self_key {
+            self.ingest(&frame[PEER_RELAY_HEADER..], None, Some(src)).await;
+            return;
+        }
+        let Some(ep) = self.peers.get(&dest).and_then(|p| p.endpoint) else { return };
+        let _ = self.socket.send_to(frame, target(ep)).await;
+    }
+
+    /// Feed a WG datagram (from UDP, server relay or peer relay) to whichever
+    /// peer accepts it. `peer_relay_via` marks the reply path through a peer.
+    async fn ingest(&mut self, datagram: &[u8], src: Option<SocketAddr>, peer_relay_via: Option<SocketAddr>) {
         let keys: Vec<String> = self.peers.keys().cloned().collect();
         for key in keys {
             let act = {
@@ -553,6 +609,11 @@ impl Engine {
                 }
             };
             if let Some(peer) = self.peers.get_mut(&key) {
+                if let Some(via) = peer_relay_via {
+                    peer.via_endpoint = Some(via);
+                    peer.use_peer_relay = true;
+                    peer.last_peer_relay = Instant::now();
+                }
                 if let Some(src) = src {
                     peer.endpoint = Some(src);
                     peer.last_direct = Instant::now();
@@ -595,14 +656,23 @@ impl Engine {
             }
         }
         let keys: Vec<String> = self.peers.keys().cloned().collect();
+        let direct: Vec<SocketAddr> = self.peers.values().filter_map(|p| p.endpoint).collect();
         for key in keys {
             let (act, punch_due) = {
                 let peer = self.peers.get_mut(&key).unwrap();
+                if peer.use_peer_relay && now.duration_since(peer.last_peer_relay) > PEER_RELAY_TIMEOUT {
+                    peer.use_peer_relay = false;
+                    peer.via_endpoint = None;
+                }
+                if peer.endpoint.is_none() && !peer.tcp_proven && !peer.use_peer_relay {
+                    peer.via_endpoint = direct.first().copied();
+                }
                 // No proven direct path (UDP recent or TCP proven) for a while
                 // -> activate relay. A still-probing TCP sender must not block
                 // this, otherwise a black-holed TCP connect cuts connectivity.
                 if !peer.use_relay
                     && !peer.tcp_proven
+                    && !peer.use_peer_relay
                     && now.duration_since(peer.created) > Duration::from_secs(8)
                     && now.duration_since(peer.last_direct) > Duration::from_secs(10)
                 {
@@ -695,5 +765,16 @@ mod tests {
             predict_ports(&[base, base], 2),
             vec!["203.0.113.7:4001".parse().unwrap(), "203.0.113.7:4002".parse().unwrap()]
         );
+    }
+
+    #[test]
+    fn peer_relay_frame_roundtrip() {
+        let dest = [7u8; 32];
+        let wg = b"wg-bytes";
+        let frame = peer_relay_frame(&dest, wg);
+        assert!(frame.starts_with(PEER_RELAY_MAGIC));
+        assert_eq!(&frame[4..36], &dest);
+        assert_eq!(&frame[PEER_RELAY_HEADER..], wg);
+        assert_eq!(peer_key(&dest), encode_key(&PublicKey::from(dest)));
     }
 }

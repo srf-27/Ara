@@ -125,6 +125,109 @@ async fn two_clients_exchange_ip_packets() {
     send_ba.abort();
 }
 
+/// Force the direct-TCP transport: two engines whose UDP candidates are a
+/// black hole (nothing listens) but whose TCP candidates point at each other's
+/// real listener. Verifies handshake + bidirectional IP delivery over TCP only.
+#[tokio::test]
+async fn two_clients_exchange_ip_packets_over_tcp() {
+    use ara::engine::{encode_key, Command, Engine};
+    use ara::proto::PeerInfo;
+    use boringtun::x25519::{PublicKey, StaticSecret};
+
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("ara=debug")
+        .with_test_writer()
+        .try_init();
+
+    struct Node {
+        vip: Ipv4Addr,
+        public: PublicKey,
+        tcp_addr: std::net::SocketAddr,
+        to_engine: mpsc::Sender<Vec<u8>>,
+        from_engine: mpsc::Receiver<Vec<u8>>,
+        cmd_tx: mpsc::Sender<Command>,
+    }
+
+    async fn node(vip: Ipv4Addr) -> Node {
+        let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let public = PublicKey::from(&secret);
+        let socket = Arc::new(bind_udp(0).unwrap());
+        let (to_engine, engine_out) = mpsc::channel(256);
+        let (engine_in, from_engine) = mpsc::channel(256);
+        let (relay_tx, mut relay_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let engine = Engine::new(
+            socket, secret, engine_out, engine_in, relay_tx, cmd_rx, cmd_tx.clone(),
+        );
+        tokio::spawn(async move {
+            if let Err(e) = engine.run().await {
+                tracing::error!("engine stopped: {e}");
+            }
+        });
+        tokio::spawn(async move { while relay_rx.recv().await.is_some() {} });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tcp_addr = listener.local_addr().unwrap();
+        let tx = cmd_tx.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                if tx.send(Command::TcpAccepted(stream)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Node { vip, public, tcp_addr, to_engine, from_engine, cmd_tx }
+    }
+
+    let mut a = node(Ipv4Addr::new(10, 99, 0, 1)).await;
+    let mut b = node(Ipv4Addr::new(10, 99, 0, 2)).await;
+    let blackhole: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+    let info_b = PeerInfo {
+        public_key: encode_key(&b.public),
+        virtual_ip: b.vip,
+        candidates: vec![blackhole],
+        tcp: vec![b.tcp_addr],
+    };
+    let info_a = PeerInfo {
+        public_key: encode_key(&a.public),
+        virtual_ip: a.vip,
+        candidates: vec![blackhole],
+        // B cannot reach A's TCP (A behind NAT): forces B to use the inbound
+        // connection A opens, exercising the inbound writer-matching path.
+        tcp: vec![blackhole],
+    };
+    a.cmd_tx.send(Command::AddPeer(info_b)).await.unwrap();
+    b.cmd_tx.send(Command::AddPeer(info_a)).await.unwrap();
+
+    let pkt_ab = ip_packet(a.vip, b.vip, b"tcp-from-a");
+    let pkt_ba = ip_packet(b.vip, a.vip, b"tcp-from-b");
+    let send_ab = tokio::spawn({
+        let tx = a.to_engine.clone();
+        let pkt = pkt_ab.clone();
+        async move {
+            loop {
+                if tx.send(pkt.clone()).await.is_err() { break; }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+    });
+    let send_ba = tokio::spawn({
+        let tx = b.to_engine.clone();
+        let pkt = pkt_ba.clone();
+        async move {
+            loop {
+                if tx.send(pkt.clone()).await.is_err() { break; }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+    });
+
+    expect_packet(&mut b.from_engine, &pkt_ab).await;
+    expect_packet(&mut a.from_engine, &pkt_ba).await;
+    send_ab.abort();
+    send_ba.abort();
+}
+
 #[tokio::test]
 async fn relay_routes_binary_frames() {
     use base64::Engine as _;

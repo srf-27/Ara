@@ -87,14 +87,9 @@ pub async fn run(
         Ok(listener) => {
             let tx = cmd_tx.clone();
             tokio::spawn(async move {
-                loop {
-                    match listener.accept().await {
-                        Ok((stream, _)) => {
-                            if tx.send(Command::TcpAccepted(stream)).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
+                while let Ok((stream, _)) = listener.accept().await {
+                    if tx.send(Command::TcpAccepted(stream)).await.is_err() {
+                        break;
                     }
                 }
             });

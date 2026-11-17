@@ -18,10 +18,9 @@ use crate::proto::PeerInfo;
 use crate::{stun, KEEPALIVE_SECS};
 
 const BUF: usize = 2048;
-/// Direct-TCP transport is implemented but has a connection-lifecycle bug
-/// (conns drop right after establish); gated off until fixed. Relay fallback
-/// remains the working non-UDP path.
-const TCP_DIRECT: bool = false;
+/// Direct-TCP transport: used once proven by a received WG packet; relay stays
+/// active until then so a black-holed TCP connect never cuts connectivity.
+const TCP_DIRECT: bool = true;
 const TICK: Duration = Duration::from_millis(250);
 const PUNCH_INTERVAL: Duration = Duration::from_secs(2);
 const STUN_TIMEOUT: Duration = Duration::from_secs(3);
@@ -86,17 +85,32 @@ async fn apply(
     socket: &UdpSocket,
     ip_in: &mpsc::Sender<Vec<u8>>,
     relay_out: &mpsc::Sender<Vec<u8>>,
-    peer: &Peer,
+    peer: &mut Peer,
     act: Action,
 ) {
     match act {
         Action::Send(bytes) => {
+            // Self-heal a zombie TCP sender: if the writer task died the channel
+            // is closed; drop it and fall back to relay immediately.
+            if peer.tcp_tx.as_ref().is_some_and(|tx| tx.is_closed()) {
+                peer.tcp_tx = None;
+                peer.tcp_proven = false;
+                peer.use_relay = true;
+            }
             let direct_recent =
                 Instant::now().duration_since(peer.last_direct) < Duration::from_secs(10);
             if !direct_recent {
+                if peer.tcp_proven {
+                    if let Some(tx) = &peer.tcp_tx {
+                        let _ = tx.send(bytes).await;
+                        return;
+                    }
+                }
+                // Unproven TCP: probe it with a copy so the WG handshake can
+                // establish the path; relay/UDP below keep connectivity until
+                // it is proven. WG dedups, so multi-path sending is safe.
                 if let Some(tx) = &peer.tcp_tx {
-                    let _ = tx.send(bytes).await;
-                    return;
+                    let _ = tx.send(bytes.clone()).await;
                 }
                 if peer.use_relay {
                     let mut frame = peer.key_bytes.to_vec();
@@ -146,6 +160,10 @@ struct Peer {
     candidates: Vec<SocketAddr>,
     tcp: Vec<SocketAddr>,
     tcp_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// True only after a WG packet was successfully received over TCP. Until
+    /// then the relay stays active so a black-holed TCP connect (NAT SYN proxy)
+    /// never cuts connectivity.
+    tcp_proven: bool,
     last_tcp_try: Instant,
     endpoint: Option<SocketAddr>,
     last_punch: Instant,
@@ -278,10 +296,13 @@ impl Engine {
                 self.ingest_tcp(&data, key, conn).await;
             }
             Command::TcpClosed(conn) => {
+                tracing::debug!("tcp conn {conn} closed");
                 self.tcp_writers.remove(&conn);
                 for p in self.peers.values_mut() {
                     if p.tcp_tx.as_ref().is_some_and(|tx| tx.is_closed()) {
                         p.tcp_tx = None;
+                        p.tcp_proven = false;
+                        p.use_relay = true;
                     }
                 }
             }
@@ -321,6 +342,7 @@ impl Engine {
             candidates: info.candidates,
             tcp: info.tcp,
             tcp_tx: None,
+            tcp_proven: false,
             last_tcp_try: Instant::now() - Duration::from_secs(10),
             endpoint: None,
             last_punch: Instant::now() - PUNCH_INTERVAL,
@@ -345,23 +367,28 @@ impl Engine {
         let _ = stream.set_nodelay(true);
         let conn = self.next_conn;
         self.next_conn += 1;
+        tracing::debug!("attach tcp conn {conn} outbound={outbound} key={key}");
         let (mut rd, mut wr) = stream.into_split();
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
         let cmd_tx = self.cmd_sender();
+        let cmd_tx_wr = cmd_tx.clone();
         let hint = if outbound { Some(key.to_string()) } else { None };
         tokio::spawn(async move {
             use tokio::io::AsyncReadExt;
             let mut lenbuf = [0u8; 2];
             loop {
                 if rd.read_exact(&mut lenbuf).await.is_err() {
+                    tracing::debug!("tcp reader conn {conn}: read len eof/err");
                     break;
                 }
                 let n = u16::from_be_bytes(lenbuf) as usize;
                 if n == 0 || n > BUF {
+                    tracing::debug!("tcp reader conn {conn}: bad len {n}");
                     break;
                 }
                 let mut data = vec![0u8; n];
                 if rd.read_exact(&mut data).await.is_err() {
+                    tracing::debug!("tcp reader conn {conn}: read body eof/err");
                     break;
                 }
                 if cmd_tx.send(Command::TcpIn { conn, key: hint.clone(), data }).await.is_err() {
@@ -375,15 +402,19 @@ impl Engine {
             while let Some(data) = rx.recv().await {
                 let len = (data.len() as u16).to_be_bytes();
                 if wr.write_all(&len).await.is_err() || wr.write_all(&data).await.is_err() {
+                    tracing::debug!("tcp writer conn {conn}: write err, exiting");
                     break;
                 }
             }
+            // Notify the engine promptly so a dead sender is cleared and the
+            // peer falls back to relay without waiting for the reader's EOF.
+            let _ = cmd_tx_wr.send(Command::TcpClosed(conn)).await;
         });
         if outbound {
             if let Some(p) = self.peers.get_mut(key) {
                 p.tcp_tx = Some(tx);
-                p.use_relay = false;
-                tracing::info!("peer {} direct TCP established", p.virtual_ip);
+                // Keep relay active until TCP is proven by a received packet.
+                tracing::debug!("peer {} outbound TCP attached (probing)", p.virtual_ip);
             }
         } else {
             self.tcp_writers.insert(conn, tx);
@@ -410,10 +441,13 @@ impl Engine {
                 }
             };
             if let Some(peer) = self.peers.get_mut(&key) {
-                if peer.tcp_tx.is_none() {
+                // A valid WG packet over TCP proves this direct path works; only
+                // now disable the relay fallback.
+                peer.tcp_proven = true;
+                peer.use_relay = false;
+                if peer.tcp_tx.as_ref().is_none_or(|tx| tx.is_closed()) {
                     if let Some(tx) = self.tcp_writers.remove(&conn) {
                         peer.tcp_tx = Some(tx);
-                        peer.use_relay = false;
                         tracing::info!("peer {} direct TCP (inbound) established", peer.virtual_ip);
                     }
                 }
@@ -438,7 +472,7 @@ impl Engine {
             let res = peer.tunn.encapsulate(packet, &mut dst_buf);
             action(res)
         };
-        if let Some(peer) = self.peers.get(&key) {
+        if let Some(peer) = self.peers.get_mut(&key) {
             apply(&self.socket, &self.ip_in, &self.relay_out, peer, act).await;
         }
     }
@@ -498,7 +532,7 @@ impl Engine {
                     other => action(other),
                 }
             };
-            if let Some(peer) = self.peers.get(key) {
+            if let Some(peer) = self.peers.get_mut(key) {
                 apply(&self.socket, &self.ip_in, &self.relay_out, peer, act).await;
             }
         }
@@ -517,9 +551,11 @@ impl Engine {
         for key in keys {
             let (act, punch_due) = {
                 let peer = self.peers.get_mut(&key).unwrap();
-                // No direct UDP path for a while -> prefer direct TCP, else relay.
+                // No proven direct path (UDP recent or TCP proven) for a while
+                // -> activate relay. A still-probing TCP sender must not block
+                // this, otherwise a black-holed TCP connect cuts connectivity.
                 if !peer.use_relay
-                    && peer.tcp_tx.is_none()
+                    && !peer.tcp_proven
                     && now.duration_since(peer.created) > Duration::from_secs(8)
                     && now.duration_since(peer.last_direct) > Duration::from_secs(10)
                 {
@@ -556,7 +592,7 @@ impl Engine {
                     .is_none_or(|d| d > Duration::from_secs(30));
                 (action(res), stale && now.duration_since(peer.last_punch) > PUNCH_INTERVAL)
             };
-            if let Some(peer) = self.peers.get(&key) {
+            if let Some(peer) = self.peers.get_mut(&key) {
                 apply(&self.socket, &self.ip_in, &self.relay_out, peer, act).await;
             }
             if punch_due {

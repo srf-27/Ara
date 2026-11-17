@@ -649,3 +649,70 @@ async fn symmetric_nat_port_prediction_punches_through() {
     expect_packet(&mut b.from_engine, &pkt).await;
     pumper.abort();
 }
+
+/// Regression: A and C have no direct path and the server relay is drained.
+/// All WG packets must travel one hop through the directly-connected peer B,
+/// in both directions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_relay_delivers_without_server() {
+    use ara::engine::{encode_key, Command, Engine};
+    use ara::proto::PeerInfo;
+    use boringtun::x25519::{PublicKey, StaticSecret};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    struct Node {
+        vip: Ipv4Addr,
+        public: PublicKey,
+        addr: SocketAddr,
+        to_engine: mpsc::Sender<Vec<u8>>,
+        from_engine: mpsc::Receiver<Vec<u8>>,
+        cmd_tx: mpsc::Sender<Command>,
+    }
+    async fn node(vip: Ipv4Addr) -> Node {
+        let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let public = PublicKey::from(&secret);
+        let socket = Arc::new(bind_udp(0).unwrap());
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), socket.local_addr().unwrap().port());
+        let (to_engine, engine_out) = mpsc::channel(256);
+        let (engine_in, from_engine) = mpsc::channel(256);
+        let (relay_tx, mut relay_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let engine = Engine::new(socket, secret, engine_out, engine_in, relay_tx, cmd_rx, cmd_tx.clone());
+        tokio::spawn(async move { let _ = engine.run().await; });
+        tokio::spawn(async move { while relay_rx.recv().await.is_some() {} });
+        Node { vip, public, addr, to_engine, from_engine, cmd_tx }
+    }
+
+    let mut a = node(Ipv4Addr::new(10, 99, 0, 1)).await;
+    let b = node(Ipv4Addr::new(10, 99, 0, 2)).await;
+    let mut c = node(Ipv4Addr::new(10, 99, 0, 3)).await;
+    let blackhole: SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let info = |n: &Node, candidates: Vec<SocketAddr>| PeerInfo {
+        public_key: encode_key(&n.public),
+        virtual_ip: n.vip,
+        candidates,
+        tcp: vec![],
+        symmetric: false,
+    };
+    a.cmd_tx.send(Command::AddPeer(info(&b, vec![b.addr]))).await.unwrap();
+    a.cmd_tx.send(Command::AddPeer(info(&c, vec![blackhole]))).await.unwrap();
+    b.cmd_tx.send(Command::AddPeer(info(&a, vec![a.addr]))).await.unwrap();
+    b.cmd_tx.send(Command::AddPeer(info(&c, vec![c.addr]))).await.unwrap();
+    c.cmd_tx.send(Command::AddPeer(info(&b, vec![b.addr]))).await.unwrap();
+    c.cmd_tx.send(Command::AddPeer(info(&a, vec![blackhole]))).await.unwrap();
+
+    let pkt_ac = ip_packet(a.vip, c.vip, b"peer-relay-a-c");
+    let pkt_ca = ip_packet(c.vip, a.vip, b"peer-relay-c-a");
+    let pump = |tx: mpsc::Sender<Vec<u8>>, pkt: Vec<u8>| tokio::spawn(async move {
+        loop {
+            if tx.send(pkt.clone()).await.is_err() { break; }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    });
+    let pa = pump(a.to_engine.clone(), pkt_ac.clone());
+    let pc = pump(c.to_engine.clone(), pkt_ca.clone());
+    expect_packet(&mut c.from_engine, &pkt_ac).await;
+    expect_packet(&mut a.from_engine, &pkt_ca).await;
+    pa.abort();
+    pc.abort();
+}

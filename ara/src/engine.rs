@@ -81,6 +81,25 @@ fn target(addr: SocketAddr) -> SocketAddr {
     }
 }
 
+/// Non-blocking TCP send. The engine is a single loop; awaiting a TCP writer
+/// that stalls on a black-holed connection (NAT SYN proxy) would freeze it.
+/// Returns true if the sender accepted the bytes. A dead sender is dropped and
+/// the peer reverts to relay; a merely full (busy/stalled) sender is kept — the
+/// writer's write timeout reaps it if it never drains.
+fn send_tcp(peer: &mut Peer, bytes: &[u8]) -> bool {
+    let Some(tx) = &peer.tcp_tx else { return false };
+    match tx.try_send(bytes.to_vec()) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            peer.tcp_tx = None;
+            peer.tcp_proven = false;
+            peer.use_relay = true;
+            false
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => false,
+    }
+}
+
 async fn apply(
     socket: &UdpSocket,
     ip_in: &mpsc::Sender<Vec<u8>>,
@@ -90,32 +109,19 @@ async fn apply(
 ) {
     match act {
         Action::Send(bytes) => {
-            // Self-heal a zombie TCP sender: if the writer task died the channel
-            // is closed; drop it and fall back to relay immediately.
-            if peer.tcp_tx.as_ref().is_some_and(|tx| tx.is_closed()) {
-                peer.tcp_tx = None;
-                peer.tcp_proven = false;
-                peer.use_relay = true;
-            }
             let direct_recent =
                 Instant::now().duration_since(peer.last_direct) < Duration::from_secs(10);
             if !direct_recent {
-                if peer.tcp_proven {
-                    if let Some(tx) = &peer.tcp_tx {
-                        let _ = tx.send(bytes).await;
-                        return;
-                    }
-                }
-                // Unproven TCP: probe it with a copy so the WG handshake can
-                // establish the path; relay/UDP below keep connectivity until
-                // it is proven. WG dedups, so multi-path sending is safe.
-                if let Some(tx) = &peer.tcp_tx {
-                    let _ = tx.send(bytes.clone()).await;
+                let tcp_ok = send_tcp(peer, &bytes);
+                if tcp_ok && peer.tcp_proven {
+                    return;
                 }
                 if peer.use_relay {
                     let mut frame = peer.key_bytes.to_vec();
                     frame.extend_from_slice(&bytes);
-                    let _ = relay_out.send(frame).await;
+                    // Non-blocking: a saturated relay must not stall the loop
+                    // (it still needs to drain inbound ACKs). Drop on full.
+                    let _ = relay_out.try_send(frame);
                     return;
                 }
             }
@@ -128,7 +134,7 @@ async fn apply(
             }
         }
         Action::ToTun(bytes) => {
-            let _ = ip_in.send(bytes).await;
+            let _ = ip_in.try_send(bytes);
         }
         Action::None => {}
     }
@@ -139,13 +145,11 @@ async fn punch(socket: &UdpSocket, relay_out: &mpsc::Sender<Vec<u8>>, peer: &mut
     let mut dst_buf = [0u8; BUF];
     let res = peer.tunn.format_handshake_initiation(&mut dst_buf, false);
     if let TunnResult::WriteToNetwork(bytes) = res {
-        if let Some(tx) = &peer.tcp_tx {
-            let _ = tx.send(bytes.to_vec()).await;
-        }
+        send_tcp(peer, bytes);
         if peer.use_relay {
             let mut frame = peer.key_bytes.to_vec();
             frame.extend_from_slice(bytes);
-            let _ = relay_out.send(frame).await;
+            let _ = relay_out.try_send(frame);
         }
         for c in &peer.candidates {
             let _ = socket.send_to(bytes, target(*c)).await;
@@ -377,9 +381,14 @@ impl Engine {
             use tokio::io::AsyncReadExt;
             let mut lenbuf = [0u8; 2];
             loop {
-                if rd.read_exact(&mut lenbuf).await.is_err() {
-                    tracing::debug!("tcp reader conn {conn}: read len eof/err");
-                    break;
+                // Idle timeout reaps a black-holed read half (healthy peers
+                // send WG keepalives well within 60s).
+                match tokio::time::timeout(Duration::from_secs(60), rd.read_exact(&mut lenbuf)).await {
+                    Ok(Ok(_)) => {}
+                    _ => {
+                        tracing::debug!("tcp reader conn {conn}: read len eof/err/idle");
+                        break;
+                    }
                 }
                 let n = u16::from_be_bytes(lenbuf) as usize;
                 if n == 0 || n > BUF {
@@ -401,8 +410,16 @@ impl Engine {
             use tokio::io::AsyncWriteExt;
             while let Some(data) = rx.recv().await {
                 let len = (data.len() as u16).to_be_bytes();
-                if wr.write_all(&len).await.is_err() || wr.write_all(&data).await.is_err() {
-                    tracing::debug!("tcp writer conn {conn}: write err, exiting");
+                // A black-holed TCP (NAT SYN proxy) never errors but stalls
+                // write_all forever once the kernel buffer fills; bound it so
+                // the task exits, closes the socket and triggers relay fallback.
+                let res = tokio::time::timeout(Duration::from_secs(5), async {
+                    wr.write_all(&len).await?;
+                    wr.write_all(&data).await
+                })
+                .await;
+                if !matches!(res, Ok(Ok(()))) {
+                    tracing::debug!("tcp writer conn {conn}: write err/stalled, exiting");
                     break;
                 }
             }

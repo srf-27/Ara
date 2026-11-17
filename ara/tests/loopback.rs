@@ -280,6 +280,7 @@ async fn relay_routes_binary_frames() {
 /// ws-frame + server-forwarding segment. Sends N frames one-per-message
 /// (as the client session loop does) and times full delivery on loopback.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "throughput diagnostic; run on demand (CPU contention with other async tests)"]
 async fn relay_throughput_loopback() {
     use base64::Engine as _;
     use futures_util::{SinkExt, StreamExt};
@@ -457,4 +458,125 @@ async fn engine_relay_throughput_loopback() {
     let mbps = bytes as f64 / window.as_secs_f64() / 1e6;
     eprintln!("relay engine+wg loopback: {count} pkts / {bytes} B in {window:?} = {mbps:.2} MB/s");
     assert!(count > 0, "relay must deliver in steady state");
+}
+
+/// Regression: a saturated relay egress must not freeze the engine's single
+/// loop. Two engines relay to each other; once the tunnel is up we pause
+/// draining A's relay_rx (channel kept alive) and keep flooding A->B so the
+/// bounded relay_out fills. The engine must still answer a Stun command and
+/// resume delivery once drained. Before the try_send fix the loop blocked in
+/// relay_out.send().await and never processed another event (the WAN deadlock).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_backpressure_keeps_engine_responsive() {
+    use ara::engine::{encode_key, Command, Engine};
+    use ara::proto::PeerInfo;
+    use boringtun::x25519::{PublicKey, StaticSecret};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let blackhole: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+    struct Node {
+        vip: Ipv4Addr,
+        public: PublicKey,
+        to_engine: mpsc::Sender<Vec<u8>>,
+        from_engine: mpsc::Receiver<Vec<u8>>,
+        cmd_tx: mpsc::Sender<Command>,
+    }
+    async fn node(vip: Ipv4Addr) -> (Node, mpsc::Receiver<Vec<u8>>) {
+        let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let public = PublicKey::from(&secret);
+        let socket = Arc::new(bind_udp(0).unwrap());
+        let (to_engine, engine_out) = mpsc::channel(4096);
+        let (engine_in, from_engine) = mpsc::channel(4096);
+        let (relay_tx, relay_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (cmd_tx, cmd_rx) = mpsc::channel(1024);
+        let engine = Engine::new(socket, secret, engine_out, engine_in, relay_tx, cmd_rx, cmd_tx.clone());
+        tokio::spawn(async move { let _ = engine.run().await; });
+        (Node { vip, public, to_engine, from_engine, cmd_tx }, relay_rx)
+    }
+
+    let (a, mut a_relay_rx) = node(Ipv4Addr::new(10, 99, 0, 1)).await;
+    let (mut b, mut b_relay_rx) = node(Ipv4Addr::new(10, 99, 0, 2)).await;
+
+    // B->A relay forward: always drains. Frames are [32-byte dest key][WG];
+    // strip the key prefix exactly as the server does before RelayIn.
+    let a_cmd = a.cmd_tx.clone();
+    tokio::spawn(async move {
+        while let Some(bytes) = b_relay_rx.recv().await {
+            if bytes.len() <= 32 { continue; }
+            if a_cmd.send(Command::RelayIn(bytes[32..].to_vec())).await.is_err() { break; }
+        }
+    });
+    // A->B relay forward with a pause gate; keeps relay_rx alive when paused so
+    // the channel fills (Full) rather than closes.
+    let pause = Arc::new(AtomicBool::new(false));
+    let b_cmd = b.cmd_tx.clone();
+    let gate = pause.clone();
+    tokio::spawn(async move {
+        loop {
+            if gate.load(Ordering::Relaxed) { tokio::task::yield_now().await; continue; }
+            match a_relay_rx.recv().await {
+                Some(bytes) => {
+                    if bytes.len() <= 32 { continue; }
+                    if b_cmd.send(Command::RelayIn(bytes[32..].to_vec())).await.is_err() { break; }
+                }
+                None => break,
+            }
+        }
+    });
+
+    a.cmd_tx.send(Command::AddPeer(PeerInfo {
+        public_key: encode_key(&b.public), virtual_ip: b.vip,
+        candidates: vec![blackhole], tcp: vec![],
+    })).await.unwrap();
+    b.cmd_tx.send(Command::AddPeer(PeerInfo {
+        public_key: encode_key(&a.public), virtual_ip: a.vip,
+        candidates: vec![blackhole], tcp: vec![],
+    })).await.unwrap();
+
+    let pkt = ip_packet(a.vip, b.vip, &vec![0u8; 1280]);
+    let stop = Arc::new(AtomicBool::new(false));
+    let pumper = tokio::spawn({
+        let tx = a.to_engine.clone();
+        let pkt = pkt.clone();
+        let stop = stop.clone();
+        async move {
+            while !stop.load(Ordering::Relaxed) {
+                if tx.send(pkt.clone()).await.is_err() { break; }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    });
+
+    // Warmup: relay activates ~8s in, then the WG handshake completes over it.
+    let first = tokio::time::timeout(Duration::from_secs(25), b.from_engine.recv())
+        .await.expect("relay warmup timeout").expect("channel closed");
+    assert_eq!(first, pkt);
+
+    // Saturate A's relay egress, then probe engine responsiveness.
+    pause.store(true, Ordering::Relaxed);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (reply_tx, reply_rx) = oneshot::channel();
+    a.cmd_tx.send(Command::Stun { server: blackhole, reply: reply_tx }).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(6), reply_rx)
+        .await
+        .expect("engine frozen: Stun not processed under relay backpressure")
+        .expect("stun reply channel");
+
+    // Draining again must resume delivery (loop survived, tunnel intact).
+    pause.store(false, Ordering::Relaxed);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "delivery did not resume after backpressure");
+        match tokio::time::timeout(remaining.min(Duration::from_millis(500)), b.from_engine.recv()).await {
+            Ok(Some(got)) if got == pkt => break,
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("channel closed"),
+            Err(_) => {}
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    pumper.await.unwrap();
 }

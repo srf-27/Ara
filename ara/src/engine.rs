@@ -460,6 +460,9 @@ impl Engine {
             if let Some(peer) = self.peers.get_mut(&key) {
                 // A valid WG packet over TCP proves this direct path works; only
                 // now disable the relay fallback.
+                if !peer.tcp_proven {
+                    tracing::info!("peer {} direct TCP proven", peer.virtual_ip);
+                }
                 peer.tcp_proven = true;
                 peer.use_relay = false;
                 if peer.tcp_tx.as_ref().is_none_or(|tx| tx.is_closed()) {

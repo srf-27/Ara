@@ -84,4 +84,16 @@ mod tests {
             assert_eq!(decode(&encode(&m)).unwrap(), m);
         }
     }
+
+    #[test]
+    fn old_messages_without_symmetric_decode_as_cone() {
+        let old = r#"{"type":"candidates","candidates":[],"tcp":[]}"#;
+        assert_eq!(
+            decode(old).unwrap(),
+            Message::Candidates { candidates: vec![], tcp: vec![], symmetric: false }
+        );
+        let old_peers = r#"{"type":"peers","peers":[{"public_key":"k","virtual_ip":"10.99.0.2","candidates":[],"tcp":[]}]}"#;
+        let Message::Peers { peers } = decode(old_peers).unwrap() else { panic!("expected peers") };
+        assert!(!peers[0].symmetric);
+    }
 }

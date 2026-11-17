@@ -8,6 +8,8 @@ P2P 虚拟局域网（`10.99.0.0/24`，L3，任意协议互访）。Rust + tokio
 
 ## 2. 当前状态（事实快照）
 
+> 注：本节是 M1 交付时的快照（提交数/测试数已过时）；M2 续作后的分支、提交与测试基线见 **§11**。
+
 - 仓库 `D:\repo-REPO\Ara`，远程 `github.com/srf-27/Ara.git`，**默认分支 main**（AGENTS.md 写 master，以仓库实际为准）。
 - 工作分支 `feature/m1-scaffold`，**领先 origin 6 个提交，未推送**（`gh` 未登录，PR 被阻，需用户 `gh auth login`）：
   ```
@@ -138,13 +140,13 @@ ping 10.99.0.1; iperf3 -c 10.99.0.1 -t 15; iperf3 -c 10.99.0.1 -u -b 1M -t 10
 
 ## 9. 剩余工作（M2，按优先级）
 
-每项独立分支、最小可验证步骤、PR 合 main（AGENTS.md）。**动手前先与用户确认做哪一项。**
+每项独立分支、最小可验证步骤、PR 合 main（AGENTS.md）。**动手前先与用户确认做哪一项。** 本轮进展见 §11。
 
-1. **对称 NAT 端口预测 + 生日喷洒**（双校园网 v4 场景，参考 EasyTier）：大特性。最小第一步：在现有 candidates/打洞机制上加「对对称 NAT 对端的端口增量预测 + 批量候选喷洒」，用两个对称 NAT 真机验证打洞成功率。依赖：STUN 已能判别 NAT 类型（当前未实现类型判别，需先加）。
-2. **peer-relay（借道第三方节点中继）**：数据面不过小服务器。依赖项 1 的连通性。大特性，独立分支。
-3. **发布形态**：预编译二进制 + 安装器，开箱即用（不依赖用户装 Rust），依赖安装时检测下载、走国内镜像。Windows 已有 wintun.dll 内嵌首启释放逻辑。
-4. **合 main**：用户 `gh auth login` 后，把 `feature/m1-scaffold`（6 个未推送提交）建 PR 合 main。PR 说明需含：两个死锁修复的根因/验证数据（§4）、兼容性风险（无协议变更，纯客户端行为修复）。
-5. 可选加固（小项）：信令 TLS（wss）；`ingest_tcp` 置 tcp_proven 时加一条 info 日志（当前静默，排查不便，本轮已吃亏）。
+1. ✅ **对称 NAT 端口预测 + 生日喷洒**（双校园网 v4 场景，参考 EasyTier）：已做最小第一步（STUN 双目标类型判别 + 端口增量预测喷洒 + 双对称 NAT 打洞回归测试）；双对称 NAT 真机成功率验证仍待做。
+2. ✅ **peer-relay（借道第三方节点中继）**：已做一跳 UDP 中转最小版（三节点双向回归测试）；多跳/TCP 中转待做。
+3. ✅ **发布形态**：已做最小版（release 打包脚本 + Win/Linux 离线安装器 + 配置样例 + 文档）；线上 Release assets 未发布。
+4. ⬜ **合 main**：本轮用户明确「除 PR 都做」，未做；`gh` 仍未登录。PR 说明需含：两个死锁修复的根因/验证数据（§4）、本轮协议扩展的兼容性说明（§11.2）。
+5. ✅ 部分 **可选加固**：`tcp_proven` 状态翻转 info 日志已做；wss 评估后跳过（需 TLS 证书与重启 `ara-server`，见 §11.4）。
 
 ## 10. 必须遵守的约定（AGENTS.md 摘要）
 
@@ -152,3 +154,45 @@ ping 10.99.0.1; iperf3 -c 10.99.0.1 -t 15; iperf3 -c 10.99.0.1 -u -b 1M -t 10
 - git：feature/bugfix 分支，小单元提交 `feat|fix|docs|test|chore(scope): 动词+目标`；提交前看 `git diff --cached` + `status`；**不直推 main，PR 合并**；不提交密钥/.env/构建产物；不改 .gitignore。
 - 不改用户 DNS/路由（WSL 测试 VM 的改动已在 §5 登记）；下载走国内镜像；删除走回收站/测试 trash 目录。
 - 回复末尾一两行说明跳过/未查项与风险。
+
+## 11. M2 续作进展（2026-11-18）
+
+用户选定「除合 main 外 4 项都做」。4 条独立分支按 stacked 方式串接（`feature/hardening` → `feature/packaging` → `feature/nat-port-prediction` → `feature/peer-relay`，均叠在 `feature/m1-scaffold` 的 8 个提交上）；**全部本地提交，未推送、未建 PR、未直推 main**。最终分支 `feature/peer-relay` 含本轮全部改动。
+
+### 11.1 交付清单
+
+| 项 | 提交 | 验证 |
+|---|---|---|
+| 小加固 | `48120d2` | `ingest_tcp` 置 `tcp_proven` 时状态翻转只打一条 info（不按包刷屏）；全量门禁绿 |
+| 发布形态 | `c7c23fc`、`d9422c9` | `scripts/build-release.sh` 产出 `target/dist/ara-x86_64-pc-windows-msvc.tar.gz`；`install.ps1` 临时目录安装 + `ara.exe --help` 通过；`install.sh` 本地目录分支在 Git Bash 模拟 dist 验证通过；`docs/packaging.md` |
+| 对称 NAT | `e31232d`、`01c4608` | STUN 双目标判别；`symmetric` 标记端到端；initiation 端口喷洒；`symmetric_nat_port_prediction_punches_through` 5.02s 通过（双方仅持过期端口、relay 不转发） |
+| peer-relay | `e1493e5`、`2939baf` | 一跳中转帧 + 双向路径；`peer_relay_delivers_without_server` 10.29s 通过（A↔C 黑洞、relay 丢弃、仅借 B） |
+| 兼容加固 | `027d703` | 旧消息缺 `symmetric` 字段按 false 解析（旧 server/旧客户端混跑） |
+
+### 11.2 新增不变量 / 协议（后续改动必须遵守）
+
+- §4.2 的**单事件循环不变量未破**：新增的端口喷洒与 peer-relay 帧全部走 UDP `socket.send_to`，未对任何有界通道引入阻塞 `.await`；`relay_out`/`ip_in` 仍全 `try_send`。`relay_backpressure_keeps_engine_responsive` 持续守护。
+- 路径优先级变为：UDP 直连 → TCP 直连 → **peer-relay（一跳）** → 服务器 relay。`tcp_proven` 门控、relay 激活条件（`!tcp_proven`）保持不变，仅叠加 `!use_peer_relay`。
+- 协议新增 `symmetric: bool`（`PeerInfo` / `Register` / `Candidates`），`serde(default)`：旧 server 忽略未知字段、旧客户端缺字段按 false，**无需重启 `ara-server` 即可混跑**；但旧 server 的 `Peers` 不含该字段 → 现网不会触发端口预测（保守回退 relay）。
+- peer-relay 帧：`b"ARPR" + 32B 目的公钥 + WG 包`（UDP），中转节点只按目的 peer 的直连 endpoint 转发一跳；收到有效帧后 `use_peer_relay=true` 停发服务器 relay，10s 无入站帧回退（防死锁）。
+- 端口预测：仅当对端 `symmetric`、无直连、且包为 WG handshake initiation（type 1）时，对 IPv4 候选喷 `+1..+16` 端口；relay 分支也叠加，不改变兜底路径。
+
+### 11.3 测试基线（本轮末）
+
+`cargo test --workspace`：**29 个默认测试全绿**（ara lib 17 + 集成 6 + server lib 6），另 2 个 `#[ignore]` 吞吐诊断；`cargo clippy --workspace --all-targets` 零警告。新增 7 个测试：NAT 判别、端口预测、帧编解码、旧消息兼容、server 标记往返、对称 NAT 打洞、peer-relay 三节点双向。
+
+### 11.4 真机复测（**受阻，未完成**）
+
+- `wsl.exe` 被当前会话沙箱程序黑名单拦截 → 无法按 §6 同步 WSL 源码、编译、重启 WSL 客户端。
+- Windows 交叉编译 musl 失败：`ring 0.16.20` 的汇编需要 `x86_64-linux-musl-gcc`，本机只有 MSVC/mingw；VPS 无 gcc/cargo/musl-gcc，无法就地编译 → **无法生成新 Linux 二进制，故未部署 VPS/WSL 新客户端**。
+- 只读核查（ssh，未写任何测试环境文件、未杀任何进程）：VPS `ara`(65046) 与 `ara-server`(6940) 均在跑；VPS → WSL `10.99.0.3` ping 5/5、**0% 丢包、318ms**，与 §4.3 relay 基线一致；客户端日志尾部零星 `REKEY_TIMEOUT`（离线 peer 重传，非死锁风暴）。
+- 恢复步骤：解除 `wsl.exe` 黑名单后，把 4 条分支的 `engine.rs` / `proto.rs` / `stun.rs` / `client.rs` / `ara-server/src/lib.rs` 同步到 `~/ara`，按 §6 编 WSL debug + musl release；先 `pkill -x ara` 再 scp 到 VPS、重启客户端、ping/iperf 复测。若要验证 `symmetric` 端到端生效，还需部署新版 `ara-server`（**需用户确认**，本轮未动）。
+- 端口预测的双对称 NAT 真机成功率、peer-relay 在真实 NAT 拓扑下的表现均未验证，目前只有 loopback 证据。
+
+### 11.5 已知限制 / 跳过项
+
+- wss 未做：需 TLS 证书与重启 `ara-server`（用户禁止未经确认），且 §9 标为可选。
+- 发布形态未发布线上 Release assets，联网安装（国内镜像下载分支）未做外网验证；未做服务化/自动升级。
+- peer-relay 仅单跳、仅经 UDP 直连中转、10s 空闲回退；多跳 mesh 与 TCP 中转待做。
+- 端口预测 `+1..+16` 是顺序增量假设；若不同 STUN 目标出口 IP 变化可能误判 symmetric（后果仅多喷 initiation，不影响 relay 兜底）。
+- 未做负向对照（把 `PREDICT_SPAN` 置 0 验证集成测试必失败）。

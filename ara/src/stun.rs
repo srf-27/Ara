@@ -61,6 +61,21 @@ pub fn encode_response(txid: &[u8; 12], addr: SocketAddr) -> Vec<u8> {
     buf
 }
 
+/// Compare reflexive addresses seen by different STUN servers: a NAT that
+/// allocates a different port per destination is symmetric.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NatType {
+    Cone,
+    Symmetric,
+}
+
+pub fn classify(reflexive: &[SocketAddr]) -> NatType {
+    match reflexive.first() {
+        Some(first) if reflexive.iter().skip(1).any(|a| a != first) => NatType::Symmetric,
+        _ => NatType::Cone,
+    }
+}
+
 pub fn parse_response(buf: &[u8]) -> Option<SocketAddr> {
     if buf.len() < 20 || u16::from_be_bytes([buf[0], buf[1]]) != BINDING_RESPONSE {
         return None;
@@ -135,5 +150,15 @@ mod tests {
     fn rejects_garbage() {
         assert_eq!(parse_response(&[0xff; 40]), None);
         assert_eq!(parse_response(&[]), None);
+    }
+
+    #[test]
+    fn classify_needs_two_distinct_reflexive_addresses() {
+        let a: SocketAddr = "203.0.113.7:41641".parse().unwrap();
+        let b: SocketAddr = "203.0.113.7:41642".parse().unwrap();
+        assert_eq!(classify(&[]), NatType::Cone);
+        assert_eq!(classify(&[a]), NatType::Cone);
+        assert_eq!(classify(&[a, a]), NatType::Cone);
+        assert_eq!(classify(&[a, b]), NatType::Symmetric);
     }
 }

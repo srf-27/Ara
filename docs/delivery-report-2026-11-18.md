@@ -181,13 +181,12 @@ ping 10.99.0.1; iperf3 -c 10.99.0.1 -t 15; iperf3 -c 10.99.0.1 -u -b 1M -t 10
 
 `cargo test --workspace`：**29 个默认测试全绿**（ara lib 17 + 集成 6 + server lib 6），另 2 个 `#[ignore]` 吞吐诊断；`cargo clippy --workspace --all-targets` 零警告。新增 7 个测试：NAT 判别、端口预测、帧编解码、旧消息兼容、server 标记往返、对称 NAT 打洞、peer-relay 三节点双向。
 
-### 11.4 真机复测（**受阻，未完成**）
+### 11.4 真机复测（本机 + VPS 完成，WSL 执行受阻）
 
-- `wsl.exe` 被当前会话沙箱程序黑名单拦截 → 无法按 §6 同步 WSL 源码、编译、重启 WSL 客户端。
-- Windows 交叉编译 musl 失败：`ring 0.16.20` 的汇编需要 `x86_64-linux-musl-gcc`，本机只有 MSVC/mingw；VPS 无 gcc/cargo/musl-gcc，无法就地编译 → **无法生成新 Linux 二进制，故未部署 VPS/WSL 新客户端**。
-- 只读核查（ssh，未写任何测试环境文件、未杀任何进程）：VPS `ara`(65046) 与 `ara-server`(6940) 均在跑；VPS → WSL `10.99.0.3` ping 5/5、**0% 丢包、318ms**，与 §4.3 relay 基线一致；客户端日志尾部零星 `REKEY_TIMEOUT`（离线 peer 重传，非死锁风暴）。
-- 恢复步骤：解除 `wsl.exe` 黑名单后，把 4 条分支的 `engine.rs` / `proto.rs` / `stun.rs` / `client.rs` / `ara-server/src/lib.rs` 同步到 `~/ara`，按 §6 编 WSL debug + musl release；先 `pkill -x ara` 再 scp 到 VPS、重启客户端、ping/iperf 复测。若要验证 `symmetric` 端到端生效，还需部署新版 `ara-server`（**需用户确认**，本轮未动）。
-- 端口预测的双对称 NAT 真机成功率、peer-relay 在真实 NAT 拓扑下的表现均未验证，目前只有 loopback 证据。
+- `wsl.exe` 被当前会话沙箱程序黑名单拦截 → WSL 内无法执行编译/测试/重启客户端；但源码已通过 UNC `\\wsl$\Ubuntu\root\ara` 同步（见 §12）。
+- Windows 交叉编译 musl 失败：`ring 0.16.20` 的汇编需要 `x86_64-linux-musl-gcc`，本机只有 MSVC/mingw；Docker daemon 未运行。改为 **VPS 就地编译**（dnf 装 gcc + rustc/cargo 1.100.0）。
+- **补充（03:30）**：VPS `/root/ara-src` 已同步 `edb3d7c` 源码并跑完 Linux `cargo test --workspace`（29 默认测试全绿、2 ignored、集成 39.24s）、`cargo build --release -p ara` 成功；已部署并重启新客户端，详见 §12。
+- 端口预测的双对称 NAT 真机成功率、peer-relay 在真实 NAT 拓扑下的表现仍未验证（旧 `ara-server` 不转发 `symmetric`，现网不会触发端口预测），目前只有 loopback 证据。
 
 ### 11.5 已知限制 / 跳过项
 
@@ -196,3 +195,17 @@ ping 10.99.0.1; iperf3 -c 10.99.0.1 -t 15; iperf3 -c 10.99.0.1 -u -b 1M -t 10
 - peer-relay 仅单跳、仅经 UDP 直连中转、10s 空闲回退；多跳 mesh 与 TCP 中转待做。
 - 端口预测 `+1..+16` 是顺序增量假设；若不同 STUN 目标出口 IP 变化可能误判 symmetric（后果仅多喷 initiation，不影响 relay 兜底）。
 - 未做负向对照（把 `PREDICT_SPAN` 置 0 验证集成测试必失败）。
+
+## 12. 三方同步与全量测试（2026-11-18 03:30，用户约定）
+
+**约定**：每次代码改动必须同步到本机、WSL（`~/ara`）、云服务器（VPS `/root/ara-src`）三方，再跑全量测试 `cargo test --workspace` + `cargo clippy --workspace --all-targets`；涉及真机路径还要部署复测，并记录部署的提交号 + 二进制 md5。
+
+| 方 | 同步方式 | 全量测试 | 运行中的版本 |
+|---|---|---|---|
+| 本机 | 工作树 `feature/peer-relay` @ `edb3d7c` | ✅ 29 默认 + 2 ignored、clippy 零警告 | 无客户端运行 |
+| WSL | UNC 同步 13 个改动文件，`engine.rs`/`proto.rs`/`loopback.rs`/`ara-server/lib.rs` MD5 与本机一致 | ⛔ `wsl.exe` 黑名单，WSL 内无法执行 | **仍是 M1 旧二进制**（仅源码已新） |
+| VPS | `/root/ara-src` 源码包 + dnf gcc + rustc/cargo 1.100.0 | ✅ Linux 环境 `cargo test --workspace` 29 默认全绿（集成 39.24s）、`cargo build --release -p ara` 成功 | ✅ 新二进制 `edb3d7c`，md5 `b5482dea03d8e3a4edce772ab82cd74d`，PID 71900 |
+
+- 部署按 §6：`pkill -x ara` → 替换 `/usr/local/bin/ara` → 重启客户端；**`ara-server`(6940) 未动**；`/root/ara-deploy.log` 记录提交号与 md5，客户端日志用追加而非覆盖。
+- 跨版本兼容真机验证：新客户端（带 `symmetric` 字段）成功注册到旧 `ara-server`、拿到 `10.99.0.1`；VPS → WSL `.3` relay ping **10/10、0% 丢包、318–320ms**，与 §4.3 基线一致。刚重启时 5 包 20% 丢包是握手重建期，稳定后恢复。
+- 仍缺：WSL 内编译/测试与重启 WSL 客户端（需解除 `wsl.exe` 黑名单）；双对称 NAT 真机成功率、peer-relay 真实拓扑表现。

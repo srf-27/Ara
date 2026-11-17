@@ -1,6 +1,6 @@
 # Ara 交付文档 / Agent 接手指南
 
-> 最后更新：2026-11-17。本文档供接手的 agent 快速继续开发。先读 §1–§3 了解全貌，§5 记录已修复的 TCP 死锁 bug（根因 + 修复，供回归排查），§7 是环境陷阱（务必先看，否则会浪费大量时间），§10 是 M2 剩余范围与优先级。
+> 最后更新：2026-11-18。本文档供接手的 agent 快速继续开发。先读 §1–§3 了解全貌，§5 记录已修复的两个死锁 bug（§5.1–5.5 TCP 握手死锁、§5.6 relay 负载下引擎单循环阻塞死锁，均含根因 + 修复 + 验证），§7 是环境陷阱（务必先看，否则会浪费大量时间），§10 是 M2 剩余范围与优先级。
 
 ## 1. 项目目标
 
@@ -38,6 +38,7 @@ Ara 是一个 P2P 虚拟局域网工具：把分布在各地的设备（Windows 
 | 重连 peer 表全量对齐（SetPeers） | ✅ | 修好残留死 peer |
 | **TCP 直连传输** | ✅ | loopback 集成测试 + 真机（见 §5） |
 | 僵尸 tcp_tx 自愈 + relay 无缝兜底 | ✅ | 真机验证（见 §5） |
+| **relay 负载不死锁**（引擎循环非阻塞） | ✅ | 回归测试 + 真机 iperf TCP/UDP（见 §5.6） |
 
 **真机验收成果（本轮）**：
 - 六向 ping 全通（0% 丢包）。
@@ -45,7 +46,7 @@ Ara 是一个 P2P 虚拟局域网工具：把分布在各地的设备（Windows 
 - 黑洞路径（Win↔VPS）自动走 relay，**不再 100% 丢包**（修复前僵尸 tcp_tx 会杀死连通性）。
 - 副作用核查通过：不改 DNS、不劫持默认路由、仅虚拟网段进隧道、仅指定端口通信。
 
-**测试**：`ara` lib 13 个 + `ara-server` lib 5 个 + 集成 3 个（`two_clients_exchange_ip_packets` UDP、`relay_routes_binary_frames`、`two_clients_exchange_ip_packets_over_tcp`），**全绿**；`cargo clippy --workspace --all-targets` 无警告。TCP 死锁修复见 §5。
+**测试**：`ara` lib 13 个 + `ara-server` lib 5 个 + 集成 4 个默认跑（`two_clients_exchange_ip_packets` UDP、`two_clients_exchange_ip_packets_over_tcp`、`relay_routes_binary_frames`、`relay_backpressure_keeps_engine_responsive`）+ 2 个 `#[ignore]` 吞吐诊断，**全绿**；`cargo clippy --workspace --all-targets` 无警告。TCP 死锁修复见 §5，relay 负载死锁修复见 §5.6。
 
 ## 4. 关键代码地图（`ara/src/engine.rs`）
 
@@ -53,8 +54,9 @@ Ara 是一个 P2P 虚拟局域网工具：把分布在各地的设备（Windows 
 
 - `Command` 枚举（line ~41）：`AddPeer/SetPeers/RemovePeer/Stun/RelayIn/TcpUp/TcpAccepted/TcpIn/TcpClosed`
 - `Peer` 结构（line ~151）：新增字段 `tcp_proven: bool`（TCP 是否已被收到的 WG 包证明可用）
-- `apply()`（line ~84）：路由 WG 出站包。proven 只走 TCP；未证明时 TCP probe 叠加 relay/UDP 兜底（§5.3）；开头自愈僵尸 tcp_tx
-- `punch()`（line ~131）：发 WG handshake initiation（UDP + TCP probe + relay）
+- `send_tcp()`（line ~84）：非阻塞 TCP 发送助手，`try_send`；Closed 清 tcp_tx 回退 relay，Full 跳过保留 sender（§5.6）
+- `apply()`（line ~104）：路由 WG 出站包。proven 只走 TCP；未证明时 TCP probe 叠加 relay/UDP 兜底（§5.3）；tcp_tx/relay_out/ip_in 全 `try_send` 不阻塞循环（§5.6）
+- `punch()`（line ~156）：发 WG handshake initiation（UDP + TCP probe + relay），同样非阻塞
 - `attach_tcp()`（line ~352）：把 TCP stream 拆成 reader/writer 任务；outbound 设 `peer.tcp_tx`，inbound 存 `tcp_writers[conn]`
 - `ingest_tcp()`（line ~405）：收 TCP 上的 WG 包，匹配 peer，**成功 decap 即设 `tcp_proven=true, use_relay=false`**
 - `on_tick()`（line ~537）：relay 激活判定（line ~553）+ TCP 连接尝试（line ~562）+ `update_timers`
@@ -96,6 +98,25 @@ cargo clippy --workspace --all-targets                                       # �
 ### 5.5 日志约定
 
 每包噪声日志已删（`ingest_tcp` 入口、`punch via tcp`）；保留连接级 debug（attach/reader/writer/TcpClosed）与 proven/established 的 info。新增日志勿按包打，避免高吞吐下刷屏。
+
+### 5.6 引擎单循环阻塞死锁（真机 relay 复测发现，已修复）
+
+**症状**：WSL↔VPS relay 静止时互 ping 正常（RTT ~322ms），但 iperf3 负载后**双向 100% 丢包**；VPS 引擎刷 `REKEY_TIMEOUT`/`CONNECTION_EXPIRED`，WSL 引擎负载后**零日志**（单循环卡死）。TCP iperf sender 512KB / receiver 0、cwnd 崩到 1 MSS；UDP iperf 挂起。
+
+**根因**：引擎是单事件循环，`apply()`/`punch()` 对**有界传输通道用阻塞 `.await`**：
+- `tcp_tx`（容量 256）：writer 任务 `write_all().await` 在被黑洞的 TCP（NAT SYN 代理，connect「成功」但 payload 丢）上内核缓冲填满后**永久 pending**，writer 停止排空 → 通道满 → `tx.send().await` 卡死整个循环。§5.3 的 TCP probe 把每包克隆到 TCP，负载下 <1s 填满。
+- `relay_out`（容量 256）：出口带宽饱和时 `relay_out.send().await` 阻塞循环 → 无法处理入站 ACK → relay 上的头阻塞 meltdown。
+
+**修复**（根因一次修在共享代码）：
+1. `send_tcp()` 助手 + `apply()`/`punch()` 对 tcp_tx 改 `try_send`：`Closed`→清 tcp_tx 回退 relay；`Full`→跳过该包但保留 sender（由 writer 超时回收）。引擎循环永不阻塞在 TCP。
+2. `relay_out`/`ip_in` 改 `try_send`：满则丢包（WG/上层重传），循环保持响应入站。饱和丢包触发 TCP 拥塞退避而非死锁。
+3. TCP writer `write_all` 加 **5s 超时**：黑洞 TCP 停滞即报错退出 → `TcpClosed` → 回退 relay 并释放 socket。
+4. TCP reader 首帧读加 **60s 空闲超时**：回收黑洞读半侧（健康 peer ≤25s keepalive，不会误杀）。
+
+**验证**：
+- 回归测试 `relay_backpressure_keeps_engine_responsive`（默认跑，~14s）：暂停排空 A 的 relay_rx（通道保活）灌包填满 relay_out，断言引擎仍响应 `Stun` 命令、恢复排空后继续投递。**修复前失败（引擎卡死），修复后通过**。
+- 真机 WSL↔VPS relay：TCP iperf 15s sender 5.5MB/3.08Mbps、receiver 4.5MB/2.33Mbps、**0 重传**、cwnd 106KB→914KB 健康增长；UDP iperf 10s@1M **0% 丢包**；负载前后 ping 0% 丢包、引擎计时正常。死锁根除。
+- ~3Mbps 是 WAN relay 带宽上限（校园网→境外 VPS、322ms RTT、TCP-over-TCP），非代码瓶颈。
 
 ## 6. 测试与构建命令
 
@@ -164,10 +185,11 @@ cp target/x86_64-unknown-linux-musl/release/ara /mnt/d/repo-REPO/Ara/target/ara-
 按 AGENTS.md「最小完整改动」原则：每项独立分支、先做最小可验证步骤，勿一次性堆功能。
 
 1. ✅ **TCP 测试回归**：已修复并全量验证（§5）。
-2. **relay 吞吐优化**（兜底路径）：**瓶颈已定位**（loopback 基准，`ara/tests/loopback.rs`）：
-   - 裸 ws+服务器转发 `relay_throughput_loopback` ≈ **77 MB/s**；引擎+WG 全链路 `engine_relay_throughput_loopback`（`#[ignore]`，按需 `--ignored`）≈ **5 MB/s**（UDP 载荷）。两者都高于 VPS 30M 带宽（3.75 MB/s），且代码流水线无停等。
-   - 真机 ~10–40 KB/s ≈ 1 pkt/RTT，是**延迟驱动的停等**，非代码吞吐上限；最可能是 **TCP-over-TCP meltdown**（内层 TCP 跑在 TCP ws 中继上），且可能是 zombie/sleep 修复前的旧测量。
-   - **结论**：relay 代码健康，勿先改架构（批处理/多连接治不了 meltdown；UDP 中继在校园网封 UDP 场景不可用）。**下一步**：真机受控复测——分别用 UDP 载荷（`iperf3 -u`）与 TCP 载荷（`iperf3`）走 relay，若 UDP≈MB/s 而 TCP≈KB/s 即坐实 meltdown。TCP 直连（已修，270Mbps）才是目标场景的主路径，relay 仅最后兜底。
+2. ✅ **relay 兜底可用性**（真机复测发现并修复死锁，见 §5.6）：
+   - 真机受控复测（WSL↔VPS relay）**推翻了「代码健康、纯 TCP-over-TCP meltdown」的旧结论**：静止互 ping 正常，但 iperf 负载后双向 100% 丢包、引擎单循环卡死。根因是 `apply()`/`punch()` 对有界 tcp_tx/relay_out 用阻塞 `.await`，黑洞 TCP 或饱和 relay 会冻住整个事件循环（§5.6）。
+   - 已修：tcp_tx/relay_out/ip_in 全改 `try_send`（满则丢包，循环永不阻塞）+ TCP writer 5s 写超时 + reader 60s 空闲超时。回归测试 `relay_backpressure_keeps_engine_responsive` 守护。
+   - 复测成果：TCP iperf 15s ≈ 2.3–3 Mbps、**0 重传**、cwnd 健康增长；UDP iperf 1M **0% 丢包**；负载前后 ping 0% 丢包。~3Mbps 是 WAN relay 带宽上限（322ms RTT、TCP-over-TCP），非代码瓶颈。relay 仅兜底，主路径仍是 TCP/UDP 直连。
+   - loopback 吞吐诊断（`relay_throughput_loopback` 裸 ws ≈ 50–77 MB/s、`engine_relay_throughput_loopback` 引擎+WG ≈ 5 MB/s）均 `#[ignore]` 按需跑（`--ignored`），避免与正确性测试并行抢 CPU 致偶发超时。
 3. **对称 NAT 端口预测 + 生日喷洒**（双校园网 v4，参考 EasyTier）：大特性，独立分支，先做端口预测的最小验证。
 4. **借道第三方节点中继**（peer-relay，数据面不过小服务器）：大特性，依赖 3 的连通性，独立分支。
 5. **发布形态**：预编译二进制 + 安装器，开箱即用、安装时检测下载依赖、下载走国内镜像。独立分支。

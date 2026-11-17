@@ -164,7 +164,10 @@ cp target/x86_64-unknown-linux-musl/release/ara /mnt/d/repo-REPO/Ara/target/ara-
 按 AGENTS.md「最小完整改动」原则：每项独立分支、先做最小可验证步骤，勿一次性堆功能。
 
 1. ✅ **TCP 测试回归**：已修复并全量验证（§5）。
-2. **relay 吞吐优化**（兜底路径，优先级中）：当前仅 ~10–40 KB/s，背压/Nagle 已试无效，瓶颈待查。TCP 直连可用后 relay 只是兜底，但「封 UDP 且 TCP 也黑洞」场景仍需提速。**下一步**：先定位瓶颈（引擎单循环 / ws 帧 / 服务器转发哪一段），再谈批处理/多连接/UDP 中继，勿先改架构。
+2. **relay 吞吐优化**（兜底路径）：**瓶颈已定位**（loopback 基准，`ara/tests/loopback.rs`）：
+   - 裸 ws+服务器转发 `relay_throughput_loopback` ≈ **77 MB/s**；引擎+WG 全链路 `engine_relay_throughput_loopback`（`#[ignore]`，按需 `--ignored`）≈ **5 MB/s**（UDP 载荷）。两者都高于 VPS 30M 带宽（3.75 MB/s），且代码流水线无停等。
+   - 真机 ~10–40 KB/s ≈ 1 pkt/RTT，是**延迟驱动的停等**，非代码吞吐上限；最可能是 **TCP-over-TCP meltdown**（内层 TCP 跑在 TCP ws 中继上），且可能是 zombie/sleep 修复前的旧测量。
+   - **结论**：relay 代码健康，勿先改架构（批处理/多连接治不了 meltdown；UDP 中继在校园网封 UDP 场景不可用）。**下一步**：真机受控复测——分别用 UDP 载荷（`iperf3 -u`）与 TCP 载荷（`iperf3`）走 relay，若 UDP≈MB/s 而 TCP≈KB/s 即坐实 meltdown。TCP 直连（已修，270Mbps）才是目标场景的主路径，relay 仅最后兜底。
 3. **对称 NAT 端口预测 + 生日喷洒**（双校园网 v4，参考 EasyTier）：大特性，独立分支，先做端口预测的最小验证。
 4. **借道第三方节点中继**（peer-relay，数据面不过小服务器）：大特性，依赖 3 的连通性，独立分支。
 5. **发布形态**：预编译二进制 + 安装器，开箱即用、安装时检测下载依赖、下载走国内镜像。独立分支。

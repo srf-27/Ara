@@ -15,7 +15,7 @@ use crate::candidates::local_candidates;
 use crate::config::ResolvedConfig;
 use crate::engine::{bind_udp, encode_key, Command, Engine};
 use crate::proto::{self, Message, PeerInfo};
-use crate::HEARTBEAT_INTERVAL_SECS;
+use crate::{stun, HEARTBEAT_INTERVAL_SECS};
 
 /// Fallback STUN servers for when our signaling server runs TCP-only.
 const PUBLIC_STUN: &[&str] = &["stun.qq.com:3478", "stun.miwifi.com:3478"];
@@ -142,6 +142,7 @@ async fn session(
         public_key: public_key.to_string(),
         candidates: local_candidates(local_port),
         tcp: tcp_candidates(tcp_port, None),
+        symmetric: false,
     };
     sink.send(WsMessage::Text(proto::encode(&register))).await?;
 
@@ -162,6 +163,7 @@ async fn session(
     // STUN reflexive discovery over the shared socket, then publish candidates.
     // Fall back to public STUN when our server runs TCP-only (--no-stun).
     let mut reflexive = None;
+    let mut probes: Vec<SocketAddr> = Vec::new();
     let mut stun_targets = vec![server];
     for host in PUBLIC_STUN {
         if let Ok(mut addrs) = tokio::net::lookup_host(*host).await {
@@ -174,9 +176,18 @@ async fn session(
         let (stun_tx, stun_rx) = oneshot::channel();
         let _ = cmd_tx.try_send(Command::Stun { server: target, reply: stun_tx });
         if let Ok(Some(r)) = stun_rx.await {
-            reflexive = Some(r);
-            break;
+            if reflexive.is_none() {
+                reflexive = Some(r);
+            }
+            probes.push(r);
+            if probes.len() >= 2 {
+                break;
+            }
         }
+    }
+    let symmetric = stun::classify(&probes) == stun::NatType::Symmetric;
+    if symmetric {
+        tracing::info!("symmetric NAT detected: {probes:?}");
     }
     let mut candidates = local_candidates(local_port);
     if let Some(reflexive) = reflexive {
@@ -188,6 +199,7 @@ async fn session(
     sink.send(WsMessage::Text(proto::encode(&Message::Candidates {
         candidates: candidates.clone(),
         tcp: tcp_candidates(tcp_port, reflexive),
+        symmetric,
     })))
     .await?;
 
@@ -237,6 +249,7 @@ async fn session(
                     sink.send(WsMessage::Text(proto::encode(&Message::Candidates {
                         candidates: candidates.clone(),
                         tcp: tcp_candidates(tcp_port, reflexive),
+                        symmetric,
                     }))).await?;
                 }
             }

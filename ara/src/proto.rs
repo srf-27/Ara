@@ -10,6 +10,9 @@ pub struct PeerInfo {
     /// Reachable TCP endpoints for the direct-TCP fallback transport.
     #[serde(default)]
     pub tcp: Vec<SocketAddr>,
+    /// Peer detected a symmetric NAT: its reflexive port is not reusable.
+    #[serde(default)]
+    pub symmetric: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -22,6 +25,8 @@ pub enum Message {
         candidates: Vec<SocketAddr>,
         #[serde(default)]
         tcp: Vec<SocketAddr>,
+        #[serde(default)]
+        symmetric: bool,
     },
     Welcome {
         virtual_ip: Ipv4Addr,
@@ -34,6 +39,8 @@ pub enum Message {
         candidates: Vec<SocketAddr>,
         #[serde(default)]
         tcp: Vec<SocketAddr>,
+        #[serde(default)]
+        symmetric: bool,
     },
     Error {
         reason: String,
@@ -62,13 +69,14 @@ mod tests {
                 public_key: "k".into(),
                 candidates: vec!["1.2.3.4:5".parse().unwrap()],
                 tcp: vec![],
+                symmetric: true,
             },
             Message::Welcome {
                 virtual_ip: Ipv4Addr::new(10, 99, 0, 2),
                 prefix: 24,
             },
             Message::Peers { peers: vec![] },
-            Message::Candidates { candidates: vec![], tcp: vec![] },
+            Message::Candidates { candidates: vec![], tcp: vec![], symmetric: true },
             Message::Error { reason: "bad secret".into() },
             Message::Heartbeat,
         ];

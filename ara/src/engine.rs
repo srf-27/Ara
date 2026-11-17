@@ -24,6 +24,8 @@ const TCP_DIRECT: bool = true;
 const TICK: Duration = Duration::from_millis(250);
 const PUNCH_INTERVAL: Duration = Duration::from_secs(2);
 const STUN_TIMEOUT: Duration = Duration::from_secs(3);
+// shortcut: sequential +1..16 only; widen or randomize if real symmetric NATs use larger deltas.
+const PREDICT_SPAN: u16 = 16;
 
 pub fn encode_key(key: &PublicKey) -> String {
     base64::engine::general_purpose::STANDARD.encode(key.as_bytes())
@@ -81,6 +83,21 @@ fn target(addr: SocketAddr) -> SocketAddr {
     }
 }
 
+fn predict_ports(candidates: &[SocketAddr], span: u16) -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    for c in candidates.iter().filter(|c| c.is_ipv4()) {
+        for d in 1..=span {
+            let Some(port) = c.port().checked_add(d) else { break };
+            let mut p = *c;
+            p.set_port(port);
+            out.push(p);
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Non-blocking TCP send. The engine is a single loop; awaiting a TCP writer
 /// that stalls on a black-holed connection (NAT SYN proxy) would freeze it.
 /// Returns true if the sender accepted the bytes. A dead sender is dropped and
@@ -109,6 +126,13 @@ async fn apply(
 ) {
     match act {
         Action::Send(bytes) => {
+            // WG type 1 = handshake initiation; spray only while punching so
+            // relay/TCP fallback and established paths stay untouched.
+            if peer.symmetric && peer.endpoint.is_none() && !peer.tcp_proven && bytes.first() == Some(&1) {
+                for t in predict_ports(&peer.candidates, PREDICT_SPAN) {
+                    let _ = socket.send_to(&bytes, target(t)).await;
+                }
+            }
             let direct_recent =
                 Instant::now().duration_since(peer.last_direct) < Duration::from_secs(10);
             if !direct_recent {
@@ -174,6 +198,7 @@ struct Peer {
     created: Instant,
     last_direct: Instant,
     use_relay: bool,
+    symmetric: bool,
 }
 
 pub struct Engine {
@@ -315,7 +340,7 @@ impl Engine {
 
     async fn upsert_peer(&mut self, info: PeerInfo) {
         if self.peers.contains_key(&info.public_key) {
-            self.update_candidates(&info.public_key, info.candidates, info.tcp);
+            self.update_candidates(&info.public_key, info.candidates, info.tcp, info.symmetric);
             return;
         }
         let Ok(key) = decode_key(&info.public_key) else {
@@ -353,15 +378,17 @@ impl Engine {
             created: Instant::now(),
             last_direct: Instant::now() - Duration::from_secs(10),
             use_relay: false,
+            symmetric: info.symmetric,
         };
         punch(&self.socket, &self.relay_out, &mut peer).await;
         self.peers.insert(info.public_key, peer);
     }
 
-    fn update_candidates(&mut self, key: &str, candidates: Vec<SocketAddr>, tcp: Vec<SocketAddr>) {
+    fn update_candidates(&mut self, key: &str, candidates: Vec<SocketAddr>, tcp: Vec<SocketAddr>, symmetric: bool) {
         if let Some(p) = self.peers.get_mut(key) {
             p.candidates = candidates;
             p.tcp = tcp;
+            p.symmetric = symmetric;
             p.last_punch = Instant::now() - PUNCH_INTERVAL;
         }
     }
@@ -655,6 +682,18 @@ mod tests {
         assert_eq!(
             Tunn::dst_address(&pkt),
             Some(IpAddr::V4(Ipv4Addr::new(10, 99, 0, 7)))
+        );
+    }
+
+    #[test]
+    fn predict_ports_covers_increments_without_overflow() {
+        let near_max: SocketAddr = "203.0.113.7:65534".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:1000".parse().unwrap();
+        assert_eq!(predict_ports(&[near_max, v6], 3), vec!["203.0.113.7:65535".parse().unwrap()]);
+        let base: SocketAddr = "203.0.113.7:4000".parse().unwrap();
+        assert_eq!(
+            predict_ports(&[base, base], 2),
+            vec!["203.0.113.7:4001".parse().unwrap(), "203.0.113.7:4002".parse().unwrap()]
         );
     }
 }

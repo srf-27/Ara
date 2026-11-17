@@ -187,6 +187,7 @@ async fn two_clients_exchange_ip_packets_over_tcp() {
         virtual_ip: b.vip,
         candidates: vec![blackhole],
         tcp: vec![b.tcp_addr],
+        symmetric: false,
     };
     let info_a = PeerInfo {
         public_key: encode_key(&a.public),
@@ -195,6 +196,7 @@ async fn two_clients_exchange_ip_packets_over_tcp() {
         // B cannot reach A's TCP (A behind NAT): forces B to use the inbound
         // connection A opens, exercising the inbound writer-matching path.
         tcp: vec![blackhole],
+        symmetric: false,
     };
     a.cmd_tx.send(Command::AddPeer(info_b)).await.unwrap();
     b.cmd_tx.send(Command::AddPeer(info_a)).await.unwrap();
@@ -249,6 +251,7 @@ async fn relay_routes_binary_frames() {
             public_key: b64.encode(key),
             candidates: vec![],
             tcp: vec![],
+            symmetric: false,
         })
     };
 
@@ -298,6 +301,7 @@ async fn relay_throughput_loopback() {
             public_key: b64.encode(key),
             candidates: vec![],
             tcp: vec![],
+            symmetric: false,
         })
     };
     let (mut a, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
@@ -386,6 +390,7 @@ async fn engine_relay_throughput_loopback() {
             public_key: encode_key(&public),
             candidates: vec![blackhole],
             tcp: vec![blackhole],
+            symmetric: false,
         });
         ws.send(Ws::Text(reg)).await.unwrap();
         let _ = ws.next().await; // welcome
@@ -414,11 +419,11 @@ async fn engine_relay_throughput_loopback() {
     let mut b = node(Ipv4Addr::new(10, 99, 0, 2), &url, blackhole).await;
     a.cmd_tx.send(Command::AddPeer(PeerInfo {
         public_key: encode_key(&b.public), virtual_ip: b.vip,
-        candidates: vec![blackhole], tcp: vec![blackhole],
+        candidates: vec![blackhole], tcp: vec![blackhole], symmetric: false,
     })).await.unwrap();
     b.cmd_tx.send(Command::AddPeer(PeerInfo {
         public_key: encode_key(&a.public), virtual_ip: a.vip,
-        candidates: vec![blackhole], tcp: vec![blackhole],
+        candidates: vec![blackhole], tcp: vec![blackhole], symmetric: false,
     })).await.unwrap();
 
     let pkt = ip_packet(a.vip, b.vip, &vec![0u8; 1280]);
@@ -527,11 +532,11 @@ async fn relay_backpressure_keeps_engine_responsive() {
 
     a.cmd_tx.send(Command::AddPeer(PeerInfo {
         public_key: encode_key(&b.public), virtual_ip: b.vip,
-        candidates: vec![blackhole], tcp: vec![],
+        candidates: vec![blackhole], tcp: vec![], symmetric: false,
     })).await.unwrap();
     b.cmd_tx.send(Command::AddPeer(PeerInfo {
         public_key: encode_key(&a.public), virtual_ip: a.vip,
-        candidates: vec![blackhole], tcp: vec![],
+        candidates: vec![blackhole], tcp: vec![], symmetric: false,
     })).await.unwrap();
 
     let pkt = ip_packet(a.vip, b.vip, &vec![0u8; 1280]);
@@ -579,4 +584,68 @@ async fn relay_backpressure_keeps_engine_responsive() {
 
     stop.store(true, Ordering::Relaxed);
     pumper.await.unwrap();
+}
+
+/// Regression: both peers only know each other's stale symmetric-NAT port
+/// (real port = stale + delta). Handshake initiations must be sprayed over
+/// predicted ports; without the spray neither side can ever punch through.
+/// Relay is drained (not forwarded), so UDP prediction is the only path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn symmetric_nat_port_prediction_punches_through() {
+    use ara::engine::{encode_key, Command, Engine};
+    use ara::proto::PeerInfo;
+    use boringtun::x25519::{PublicKey, StaticSecret};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    struct Node {
+        vip: Ipv4Addr,
+        public: PublicKey,
+        addr: SocketAddr,
+        to_engine: mpsc::Sender<Vec<u8>>,
+        from_engine: mpsc::Receiver<Vec<u8>>,
+        cmd_tx: mpsc::Sender<Command>,
+    }
+    async fn node(vip: Ipv4Addr) -> Node {
+        let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let public = PublicKey::from(&secret);
+        let socket = Arc::new(bind_udp(0).unwrap());
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), socket.local_addr().unwrap().port());
+        let (to_engine, engine_out) = mpsc::channel(256);
+        let (engine_in, from_engine) = mpsc::channel(256);
+        let (relay_tx, mut relay_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (cmd_tx, cmd_rx) = mpsc::channel(256);
+        let engine = Engine::new(socket, secret, engine_out, engine_in, relay_tx, cmd_rx, cmd_tx.clone());
+        tokio::spawn(async move { let _ = engine.run().await; });
+        tokio::spawn(async move { while relay_rx.recv().await.is_some() {} });
+        Node { vip, public, addr, to_engine, from_engine, cmd_tx }
+    }
+
+    let a = node(Ipv4Addr::new(10, 99, 0, 1)).await;
+    let mut b = node(Ipv4Addr::new(10, 99, 0, 2)).await;
+    assert!(a.addr.port() > 20 && b.addr.port() > 20);
+    let stale_a = SocketAddr::new(a.addr.ip(), a.addr.port() - 3);
+    let stale_b = SocketAddr::new(b.addr.ip(), b.addr.port() - 5);
+
+    a.cmd_tx.send(Command::AddPeer(PeerInfo {
+        public_key: encode_key(&b.public), virtual_ip: b.vip,
+        candidates: vec![stale_b], tcp: vec![], symmetric: true,
+    })).await.unwrap();
+    b.cmd_tx.send(Command::AddPeer(PeerInfo {
+        public_key: encode_key(&a.public), virtual_ip: a.vip,
+        candidates: vec![stale_a], tcp: vec![], symmetric: true,
+    })).await.unwrap();
+
+    let pkt = ip_packet(a.vip, b.vip, b"sym-nat-prediction");
+    let pumper = tokio::spawn({
+        let tx = a.to_engine.clone();
+        let pkt = pkt.clone();
+        async move {
+            loop {
+                if tx.send(pkt.clone()).await.is_err() { break; }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+    });
+    expect_packet(&mut b.from_engine, &pkt).await;
+    pumper.abort();
 }

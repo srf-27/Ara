@@ -15,6 +15,7 @@ use crate::candidates::local_candidates;
 use crate::config::ResolvedConfig;
 use crate::engine::{bind_udp, encode_key, Command, Engine};
 use crate::proto::{self, Message, PeerInfo};
+use crate::room_state::RoomSnapshot;
 use crate::{stun, HEARTBEAT_INTERVAL_SECS};
 
 /// Fallback STUN servers for when our signaling server runs TCP-only.
@@ -61,6 +62,15 @@ impl std::fmt::Display for FatalAuth {
 }
 impl std::error::Error for FatalAuth {}
 
+#[derive(Debug)]
+struct FatalKicked(String);
+impl std::fmt::Display for FatalKicked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "kicked: {}", self.0)
+    }
+}
+impl std::error::Error for FatalKicked {}
+
 /// Run the client forever (reconnecting), until a fatal error.
 pub async fn run(
     cfg: ResolvedConfig,
@@ -98,11 +108,30 @@ pub async fn run(
     }
 
     let mut assigned = Some(assigned);
+    let mut snapshot = crate::room_state::load().unwrap_or_default();
     let mut backoff = Duration::from_secs(1);
     loop {
-        match session(&cfg, local_port, tcp_port, &public_key, &cmd_tx, &mut relay_rx, &mut assigned).await {
+        let outcome = session(
+            &cfg,
+            local_port,
+            tcp_port,
+            &public_key,
+            &cmd_tx,
+            &mut relay_rx,
+            &mut assigned,
+            &mut snapshot,
+        )
+        .await;
+        // Persist the last known room/VIP/member table on every disconnect or
+        // explicit exit, before the reconnect backoff.
+        let _ = crate::room_state::save(&snapshot);
+        match outcome {
             Ok(()) => tracing::info!("signaling closed, reconnecting"),
             Err(e) if e.is::<FatalAuth>() => {
+                tracing::error!("{e}");
+                return Err(e);
+            }
+            Err(e) if e.is::<FatalKicked>() => {
                 tracing::error!("{e}");
                 return Err(e);
             }
@@ -113,6 +142,7 @@ pub async fn run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn session(
     cfg: &ResolvedConfig,
     local_port: u16,
@@ -121,6 +151,7 @@ async fn session(
     cmd_tx: &mpsc::Sender<Command>,
     relay_rx: &mut mpsc::Receiver<Vec<u8>>,
     assigned: &mut Option<oneshot::Sender<Ipv4Addr>>,
+    snapshot: &mut RoomSnapshot,
 ) -> Result<()> {
     let server: SocketAddr = tokio::net::lookup_host((cfg.server_host.as_str(), cfg.server_port))
         .await?
@@ -143,18 +174,27 @@ async fn session(
         candidates: local_candidates(local_port),
         tcp: tcp_candidates(tcp_port, None),
         symmetric: false,
+        room_code: cfg.room_code.clone(),
+        room_password: cfg.room_password.clone(),
+        access_token: cfg.access_token.clone(),
+        nickname: cfg.nickname.clone(),
+        create_room: cfg.create_room,
     };
     sink.send(WsMessage::Text(proto::encode(&register))).await?;
 
     // First reply: Welcome or Error.
     let vip = match stream.next().await.context("closed before welcome")?? {
         WsMessage::Text(t) => match proto::decode(&t)? {
-            Message::Welcome { virtual_ip, .. } => virtual_ip,
+            Message::Welcome { virtual_ip, room_code, .. } => {
+                snapshot.room_code = room_code;
+                virtual_ip
+            }
             Message::Error { reason } => return Err(FatalAuth(reason).into()),
             other => anyhow::bail!("unexpected first message: {other:?}"),
         },
         _ => anyhow::bail!("expected text welcome"),
     };
+    snapshot.virtual_ip = Some(vip);
     tracing::info!("assigned virtual IP {vip}");
     if let Some(tx) = assigned.take() {
         let _ = tx.send(vip);
@@ -212,13 +252,26 @@ async fn session(
             msg = stream.next() => {
                 match msg {
                     Some(Ok(WsMessage::Text(t))) => {
-                        if let Ok(Message::Peers { peers }) = proto::decode(&t) {
-                            tracing::debug!("peers update: {} entries", peers.len());
-                            let others: Vec<PeerInfo> = peers
-                                .into_iter()
-                                .filter(|p| p.public_key != public_key)
-                                .collect();
-                            let _ = cmd_tx.try_send(Command::SetPeers(others));
+                        match proto::decode(&t) {
+                            Ok(Message::Peers { peers }) => {
+                                tracing::debug!("peers update: {} entries", peers.len());
+                                let others: Vec<PeerInfo> = peers
+                                    .into_iter()
+                                    .filter(|p| p.public_key != public_key)
+                                    .collect();
+                                let code = snapshot.room_code.clone();
+                                let vip = snapshot.virtual_ip;
+                                *snapshot = RoomSnapshot::from_peers(&code, vip, &others);
+                                let _ = cmd_tx.try_send(Command::SetPeers(others));
+                            }
+                            Ok(Message::RoomList { rooms }) => {
+                                tracing::info!("room list: {rooms:?}");
+                            }
+                            Ok(Message::Kicked { reason }) => {
+                                return Err(FatalKicked(reason).into());
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::debug!("bad signaling message: {e}"),
                         }
                     }
                     Some(Ok(WsMessage::Binary(b))) => {

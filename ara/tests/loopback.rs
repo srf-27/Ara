@@ -38,6 +38,11 @@ async fn start_client(server_port: u16, tag: &str) -> Client {
         local_port: 0,
         tcp_port: 0,
         identity_path: Some(std::env::temp_dir().join(format!("ara-test-{tag}.key"))),
+        room_code: String::new(),
+        room_password: String::new(),
+        access_token: String::new(),
+        nickname: String::new(),
+        create_room: false,
     };
     let (to_engine, engine_out) = mpsc::channel(256);
     let (engine_in, from_engine) = mpsc::channel(256);
@@ -187,7 +192,7 @@ async fn two_clients_exchange_ip_packets_over_tcp() {
         virtual_ip: b.vip,
         candidates: vec![blackhole],
         tcp: vec![b.tcp_addr],
-        symmetric: false,
+        symmetric: false, nickname: String::new(),
     };
     let info_a = PeerInfo {
         public_key: encode_key(&a.public),
@@ -196,7 +201,7 @@ async fn two_clients_exchange_ip_packets_over_tcp() {
         // B cannot reach A's TCP (A behind NAT): forces B to use the inbound
         // connection A opens, exercising the inbound writer-matching path.
         tcp: vec![blackhole],
-        symmetric: false,
+        symmetric: false, nickname: String::new(),
     };
     a.cmd_tx.send(Command::AddPeer(info_b)).await.unwrap();
     b.cmd_tx.send(Command::AddPeer(info_a)).await.unwrap();
@@ -252,6 +257,11 @@ async fn relay_routes_binary_frames() {
             candidates: vec![],
             tcp: vec![],
             symmetric: false,
+            room_code: String::new(),
+            room_password: String::new(),
+            access_token: String::new(),
+            nickname: String::new(),
+            create_room: false,
         })
     };
 
@@ -302,6 +312,11 @@ async fn relay_throughput_loopback() {
             candidates: vec![],
             tcp: vec![],
             symmetric: false,
+            room_code: String::new(),
+            room_password: String::new(),
+            access_token: String::new(),
+            nickname: String::new(),
+            create_room: false,
         })
     };
     let (mut a, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
@@ -391,6 +406,11 @@ async fn engine_relay_throughput_loopback() {
             candidates: vec![blackhole],
             tcp: vec![blackhole],
             symmetric: false,
+            room_code: String::new(),
+            room_password: String::new(),
+            access_token: String::new(),
+            nickname: String::new(),
+            create_room: false,
         });
         ws.send(Ws::Text(reg)).await.unwrap();
         let _ = ws.next().await; // welcome
@@ -419,11 +439,11 @@ async fn engine_relay_throughput_loopback() {
     let mut b = node(Ipv4Addr::new(10, 99, 0, 2), &url, blackhole).await;
     a.cmd_tx.send(Command::AddPeer(PeerInfo {
         public_key: encode_key(&b.public), virtual_ip: b.vip,
-        candidates: vec![blackhole], tcp: vec![blackhole], symmetric: false,
+        candidates: vec![blackhole], tcp: vec![blackhole], symmetric: false, nickname: String::new(),
     })).await.unwrap();
     b.cmd_tx.send(Command::AddPeer(PeerInfo {
         public_key: encode_key(&a.public), virtual_ip: a.vip,
-        candidates: vec![blackhole], tcp: vec![blackhole], symmetric: false,
+        candidates: vec![blackhole], tcp: vec![blackhole], symmetric: false, nickname: String::new(),
     })).await.unwrap();
 
     let pkt = ip_packet(a.vip, b.vip, &vec![0u8; 1280]);
@@ -532,11 +552,11 @@ async fn relay_backpressure_keeps_engine_responsive() {
 
     a.cmd_tx.send(Command::AddPeer(PeerInfo {
         public_key: encode_key(&b.public), virtual_ip: b.vip,
-        candidates: vec![blackhole], tcp: vec![], symmetric: false,
+        candidates: vec![blackhole], tcp: vec![], symmetric: false, nickname: String::new(),
     })).await.unwrap();
     b.cmd_tx.send(Command::AddPeer(PeerInfo {
         public_key: encode_key(&a.public), virtual_ip: a.vip,
-        candidates: vec![blackhole], tcp: vec![], symmetric: false,
+        candidates: vec![blackhole], tcp: vec![], symmetric: false, nickname: String::new(),
     })).await.unwrap();
 
     let pkt = ip_packet(a.vip, b.vip, &vec![0u8; 1280]);
@@ -628,11 +648,11 @@ async fn symmetric_nat_port_prediction_punches_through() {
 
     a.cmd_tx.send(Command::AddPeer(PeerInfo {
         public_key: encode_key(&b.public), virtual_ip: b.vip,
-        candidates: vec![stale_b], tcp: vec![], symmetric: true,
+        candidates: vec![stale_b], tcp: vec![], symmetric: true, nickname: String::new(),
     })).await.unwrap();
     b.cmd_tx.send(Command::AddPeer(PeerInfo {
         public_key: encode_key(&a.public), virtual_ip: a.vip,
-        candidates: vec![stale_a], tcp: vec![], symmetric: true,
+        candidates: vec![stale_a], tcp: vec![], symmetric: true, nickname: String::new(),
     })).await.unwrap();
 
     let pkt = ip_packet(a.vip, b.vip, b"sym-nat-prediction");
@@ -692,7 +712,7 @@ async fn peer_relay_delivers_without_server() {
         virtual_ip: n.vip,
         candidates,
         tcp: vec![],
-        symmetric: false,
+        symmetric: false, nickname: String::new(),
     };
     a.cmd_tx.send(Command::AddPeer(info(&b, vec![b.addr]))).await.unwrap();
     a.cmd_tx.send(Command::AddPeer(info(&c, vec![blackhole]))).await.unwrap();

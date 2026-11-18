@@ -3,6 +3,7 @@ pub mod client;
 pub mod config;
 pub mod engine;
 pub mod proto;
+pub mod room_state;
 pub mod stun;
 
 use std::net::Ipv4Addr;

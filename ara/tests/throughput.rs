@@ -68,6 +68,7 @@ fn info(n: &Node, candidates: Vec<SocketAddr>, tcp: Vec<SocketAddr>) -> PeerInfo
         candidates,
         tcp,
         symmetric: false,
+        nickname: String::new(),
     }
 }
 

@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -62,6 +63,23 @@ enum Command {
         #[arg(long)]
         access: PathBuf,
     },
+    /// Send one file to a room member (VIP or VIP:port).
+    Send {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Receive incoming file transfers into a directory.
+    Recv {
+        #[arg(long)]
+        dir: PathBuf,
+        #[arg(long, default_value_t = ara::transfer::TRANSFER_PORT)]
+        port: u16,
+        /// Accept requests without an interactive prompt.
+        #[arg(long)]
+        auto_accept: bool,
+    },
 }
 
 #[tokio::main]
@@ -77,6 +95,15 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = match cli.command {
         Command::Rooms { access } => return list_rooms(&access).await,
+        Command::Send { to, file } => {
+            let addr: SocketAddr = to
+                .parse()
+                .or_else(|_| format!("{to}:{}", ara::transfer::TRANSFER_PORT).parse())?;
+            return ara::transfer::send(addr, file).await;
+        }
+        Command::Recv { dir, port, auto_accept } => {
+            return ara::transfer::serve(dir, port, auto_accept).await;
+        }
         Command::Up {
             config,
             network,

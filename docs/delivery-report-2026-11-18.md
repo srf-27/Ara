@@ -258,6 +258,6 @@ ping 10.99.0.1; iperf3 -c 10.99.0.1 -t 15; iperf3 -c 10.99.0.1 -u -b 1M -t 10
 
 ### 13.4 推送与风险
 
-- 按用户本轮指令直接推送 main（无 PR）：`git branch -f main HEAD && git push origin main`，`main` 相对交付分支可 fast-forward；推送后用 `git ls-remote origin main` 校验远端哈希。
+- 按用户本轮指令直接推送 main（无 PR）：`git branch -f main HEAD && git switch main && git merge --no-edit origin/main && git push origin main`。远端 main 当时已有 PR #1 的合并节点 `7991561`（相对共同祖先 `be6908f` 无内容差异），先合并再推，不丢任何历史、无冲突；推送后用 `git ls-remote origin main` 校验。
 - 风险：直推绕过 PR 评审，回滚需 `git revert`；WSL 客户端仍跑 M1 旧二进制、旧 `ara-server` 不转发 `symmetric`，现网端口预测与 peer-relay 仍不生效（需解除黑名单并确认重启 server 后复测）。
 

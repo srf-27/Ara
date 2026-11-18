@@ -446,12 +446,10 @@ pub async fn serve(
     let (bcast, _) = broadcast::channel::<(String, String)>(256);
     let (kick_tx, _) = broadcast::channel::<(String, String)>(64);
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
-    let server_key = Arc::new(ara::engine::load_or_create_server_key(
-        &state_path
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from("ara-server-state.json"))
-            .with_file_name("server.key"),
-    ));
+    let server_key = Arc::new(match &state_path {
+        Some(path) => ara::engine::load_or_create_server_key(&path.with_file_name("server.key")),
+        None => StaticSecret::random_from_rng(rand::rngs::OsRng),
+    });
 
     if let Some(udp) = udp {
         tokio::spawn(async move {

@@ -209,3 +209,55 @@ ping 10.99.0.1; iperf3 -c 10.99.0.1 -t 15; iperf3 -c 10.99.0.1 -u -b 1M -t 10
 - 部署按 §6：`pkill -x ara` → 替换 `/usr/local/bin/ara` → 重启客户端；**`ara-server`(6940) 未动**；`/root/ara-deploy.log` 记录提交号与 md5，客户端日志用追加而非覆盖。
 - 跨版本兼容真机验证：新客户端（带 `symmetric` 字段）成功注册到旧 `ara-server`、拿到 `10.99.0.1`；VPS → WSL `.3` relay ping **10/10、0% 丢包、318–320ms**，与 §4.3 基线一致。刚重启时 5 包 20% 丢包是握手重建期，稳定后恢复。
 - 仍缺：WSL 内编译/测试与重启 WSL 客户端（需解除 `wsl.exe` 黑名单）；双对称 NAT 真机成功率、peer-relay 真实拓扑表现。
+
+## 13. M2 完整交付验收（2026-11-18 12:25）
+
+用户指令：做完全量测试、探查各连接方式传输速度、验证各功能，然后**直接推送 main**（本轮明确覆盖 AGENTS.md 的 PR 合并规范）。
+
+### 13.1 三方同步与全量测试
+
+| 方 | 同步 | `cargo test --workspace` | clippy |
+|---|---|---|---|
+| 本机 | `feature/peer-relay` 工作树（含 `ara/tests/throughput.rs`） | 29 默认全绿 + 6 ignored | 零警告 |
+| WSL | UNC 同步全部改动（含吞吐诊断、本报告），关键文件 MD5 MATCH | 未能执行（`wsl.exe` 黑名单） | 未能执行 |
+| VPS | `/root/ara-src` 全量源码 + gcc / rustc 1.100.0 | 29 默认全绿（集成 39.24s）+ 6 ignored | 零警告 |
+
+默认套件 29 = ara lib 17 + 集成 6 + server lib 6；ignored 6 = 2 个原有 relay 诊断 + 4 个新增四路径吞吐诊断。
+
+### 13.2 四路径吞吐探查（loopback 微基准，`--ignored` 按需单跑）
+
+| 路径 | 本机 Windows (MB/s) | VPS 1 核 Linux (MB/s) |
+|---|---|---|
+| UDP 直连 | 8.00 | 16.22 |
+| TCP 直连 | 16.86 | 12.88 |
+| peer-relay（一跳，数据面不过服务器） | 3.48 | 13.34 |
+| server relay（引擎间通道转发） | 23.43 | 18.21 |
+| 真实 ws 引擎 + WG relay | 10.18 | 10.25 |
+| 裸 ws relay（无引擎/WG） | 67.62 | 0.03（1 核逐帧调度受限） |
+
+- 命令：`cargo test --test throughput -- --ignored --nocapture`；ws 两项：`cargo test --test loopback -- --ignored --nocapture`（弱机务必 `--exact` 单跑）。
+- 这些是**引擎/通道开销基准，不是 WAN 带宽**。真机 WAN 基线见 §4.3：Win↔WSL TCP 直连 270 Mbps、WSL↔VPS relay ≈3 Mbps（0 重传）、relay RTT ≈318ms。本轮真机 ping 10/10、0% 丢包、318–320ms，与基线一致。
+- VPS 裸 ws 基准 30s 窗口仅 622/2000 帧（1 核 + 每帧一次 `await` 调度），不代表产品能力；该诊断已改为固定窗口 + `got > 0`，严格投递正确性由默认套件的 `relay_routes_binary_frames` 守护。
+- 真机跨机吞吐（Win↔WSL TCP 直连、WSL→VPS relay iperf）本轮**未复测**：Windows 会话非管理员（起不了 TUN 客户端）、`wsl.exe` 被黑名单拦（WSL 内无法跑 iperf3），沿用 §4.3 历史实测。
+
+### 13.3 功能验证矩阵
+
+| 功能 | 证据 |
+|---|---|
+| 注册 / 稳定 VIP / 网络隔离 / 错误密钥 / 候选刷新 / 离线清扫 | `ara-server` lib 6 测试 + VPS 真机日志（新客户端注册拿到 .1） |
+| STUN 反射与回退链 | stun lib 4 测试 + 真机日志 `STUN reflexive address` |
+| UDP 打洞 / 候选过滤 / IPv6 优先 | `two_clients_exchange_ip_packets`、`candidates` 2 测试、`udp_direct_throughput` |
+| TCP 直连（probe + `tcp_proven` 门控 + 黑洞自愈） | `two_clients_exchange_ip_packets_over_tcp`、`tcp_direct_throughput`、§4.1 真机 270 Mbps |
+| relay 兜底 / 帧格式 `[32B key][WG]` | `relay_routes_binary_frames`、两个 relay 诊断、真机 ping |
+| relay 背压不死锁（上轮根因回归） | `relay_backpressure_keeps_engine_responsive` |
+| 对称 NAT 判别 + 端口预测喷洒 | `classify_*`、`predict_ports_*`、`symmetric_nat_port_prediction_punches_through`（5.02s） |
+| peer-relay 一跳双向中转（不过服务器） | `peer_relay_frame_roundtrip`、`peer_relay_delivers_without_server`（10.29s）、`peer_relay_throughput` |
+| 协议向后兼容（旧 server / 旧客户端） | `old_messages_without_symmetric_decode_as_cone` + 真机新客户端注册旧 `ara-server` 成功 |
+| 发布形态 | `build-release.sh` 产物、`install.ps1` 临时安装 + `ara.exe --help`、`install.sh` 本地目录验证、`docs/packaging.md` |
+| 小加固 | `tcp_proven` 翻转 info 日志，全量门禁无回归 |
+
+### 13.4 推送与风险
+
+- 按用户本轮指令直接推送 main（无 PR）：`git branch -f main HEAD && git push origin main`，`main` 相对交付分支可 fast-forward；推送后用 `git ls-remote origin main` 校验远端哈希。
+- 风险：直推绕过 PR 评审，回滚需 `git revert`；WSL 客户端仍跑 M1 旧二进制、旧 `ara-server` 不转发 `symmetric`，现网端口预测与 peer-relay 仍不生效（需解除黑名单并确认重启 server 后复测）。
+

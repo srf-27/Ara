@@ -37,6 +37,14 @@ pub struct AccessFile {
     pub cert_pem: String,
 }
 
+impl AccessFile {
+    pub fn read(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read access file {}", path.display()))?;
+        serde_json::from_str(&text).context("parse access file")
+    }
+}
+
 impl ClientConfig {
     pub fn from_file(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)

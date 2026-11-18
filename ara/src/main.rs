@@ -195,7 +195,11 @@ async fn main() -> Result<()> {
             let (from_tun_tx, from_tun_rx) = mpsc::channel::<Vec<u8>>(256);
             let (to_tun_tx, to_tun_rx) = mpsc::channel::<Vec<u8>>(256);
             let (assigned_tx, assigned_rx) = oneshot::channel();
-            let client = tokio::spawn(ara::client::run(cfg, from_tun_rx, to_tun_tx, assigned_tx, None));
+            let client = tokio::spawn(async move {
+                if let Err(e) = ara::client::run(cfg, from_tun_rx, to_tun_tx, assigned_tx, None).await {
+                    eprintln!("client stopped: {e:#}");
+                }
+            });
             let vip = assigned_rx
                 .await
                 .context("failed to join room (wrong password/full room, or client exited; see logs)")?;
@@ -263,37 +267,9 @@ async fn list_rooms(access: &Path) -> Result<()> {
             .with_context(|| format!("read access file {}", access.display()))?,
     )
     .context("parse access file")?;
-    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{}", af.server))
-        .await
-        .with_context(|| format!("connect {}", af.server))?;
-    let (mut sink, mut stream) = ws.split();
-    let register = ara::proto::Message::Register {
-        network: String::new(),
-        secret: String::new(),
-        public_key: String::new(),
-        candidates: vec![],
-        tcp: vec![],
-        symmetric: false,
-        room_code: String::new(),
-        room_password: String::new(),
-        access_token: af.token,
-        nickname: String::new(),
-        create_room: false,
-    };
-    sink.send(tokio_tungstenite::tungstenite::Message::Text(
-        ara::proto::encode(&register),
-    ))
-    .await?;
-    if let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(t))) = stream.next().await {
-        match ara::proto::decode(&t)? {
-            ara::proto::Message::RoomList { rooms } => {
-                for r in rooms {
-                    println!("{}  creator={}  {}/{}", r.code, r.creator, r.members, r.limit);
-                }
-            }
-            ara::proto::Message::Error { reason } => anyhow::bail!("{reason}"),
-            other => anyhow::bail!("unexpected reply: {other:?}"),
-        }
+    let rooms = ara::client::fetch_rooms(&af.server, &af.cert_pem, &af.token, &af.server_pub).await?;
+    for r in rooms {
+        println!("{}  creator={}  {}/{}", r.code, r.creator, r.members, r.limit);
     }
     Ok(())
 }

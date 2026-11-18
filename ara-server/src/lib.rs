@@ -230,6 +230,25 @@ impl State {
         self.join_room(network, secret, public_key, "", candidates, tcp, symmetric)
     }
 
+    /// Join a room that already exists. Unknown codes are rejected instead of
+    /// silently creating a room with the caller's chosen password.
+    #[allow(clippy::too_many_arguments)]
+    pub fn join_existing_room(
+        &mut self,
+        code: &str,
+        password: &str,
+        public_key: &str,
+        nickname: &str,
+        candidates: Vec<SocketAddr>,
+        tcp: Vec<SocketAddr>,
+        symmetric: bool,
+    ) -> Result<Ipv4Addr, String> {
+        if !self.rooms.contains_key(code) {
+            return Err("room does not exist".into());
+        }
+        self.join_room(code, password, public_key, nickname, candidates, tcp, symmetric)
+    }
+
     pub fn room_list(&self) -> Vec<RoomInfo> {
         let mut out: Vec<RoomInfo> = self
             .rooms
@@ -719,15 +738,28 @@ where
 
     let vip = {
         let mut st = state.lock().await;
-        match st.join_room(
-            &code,
-            &room_password,
-            &public_key,
-            &nickname,
-            candidates,
-            tcp,
-            symmetric,
-        ) {
+        let joined = if create_room {
+            st.join_room(
+                &code,
+                &room_password,
+                &public_key,
+                &nickname,
+                candidates,
+                tcp,
+                symmetric,
+            )
+        } else {
+            st.join_existing_room(
+                &code,
+                &room_password,
+                &public_key,
+                &nickname,
+                candidates,
+                tcp,
+                symmetric,
+            )
+        };
+        match joined {
             Ok(v) => v,
             Err(reason) => {
                 let _ = sink

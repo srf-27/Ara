@@ -5,10 +5,11 @@ edition = "2021"
 
 [dependencies]
 ara = { path = "../ara" }
-eframe = { version = "0.29", default-features = false, features = ["glow"] }
+eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tun = { version = "0.6", features = ["async"] }
 single-instance = "0.3"
+rfd = "0.15"
 futures-util.workspace = true

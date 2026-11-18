@@ -177,6 +177,77 @@ pub fn own_public_key(identity_path: Option<&std::path::Path>) -> String {
     encode_key(&PublicKey::from(&secret))
 }
 
+/// Query the server's room list without joining a room. Shared by the CLI and GUI.
+pub async fn fetch_rooms(
+    server: &str,
+    cert_pem: &str,
+    token: &str,
+    server_pub: &str,
+) -> Result<Vec<crate::proto::RoomInfo>> {
+    use tokio_tungstenite::{connect_async, connect_async_tls_with_config, Connector};
+
+    let url = if cert_pem.is_empty() {
+        format!("ws://{server}")
+    } else {
+        format!("wss://{server}")
+    };
+    let (ws, _) = if cert_pem.is_empty() {
+        connect_async(&url).await
+    } else {
+        let tls = crate::tls::client_config(cert_pem)?;
+        connect_async_tls_with_config(&url, None, false, Some(Connector::Rustls(tls))).await
+    }
+    .with_context(|| format!("connect {url}"))?;
+    let (mut sink, mut stream) = ws.split();
+    let secret = load_or_create_secret(None);
+    let public_key = encode_key(&PublicKey::from(&secret));
+    let register = Message::Register {
+        network: String::new(),
+        secret: String::new(),
+        public_key,
+        candidates: vec![],
+        tcp: vec![],
+        symmetric: false,
+        room_code: String::new(),
+        room_password: String::new(),
+        access_token: token.to_string(),
+        nickname: String::new(),
+        create_room: false,
+    };
+    sink.send(WsMessage::Text(proto::encode(&register)))
+        .await
+        .context("send room list request")?;
+    let mut reply = stream
+        .next()
+        .await
+        .context("closed before room list")?
+        .context("ws read")?;
+    if let WsMessage::Text(t) = &reply {
+        if let Ok(Message::Challenge { nonce }) = proto::decode(t) {
+            if server_pub.is_empty() {
+                anyhow::bail!("server requires a DH challenge but access file has no server_pub");
+            }
+            let server_key = crate::engine::decode_key(server_pub)?;
+            let proof = crate::engine::dh_proof(&secret, &server_key, &nonce);
+            sink.send(WsMessage::Text(proto::encode(&Message::ChallengeReply { proof })))
+                .await?;
+            reply = stream
+                .next()
+                .await
+                .context("closed after challenge")?
+                .context("ws read")?;
+        }
+    }
+    let WsMessage::Text(text) = reply else {
+        anyhow::bail!("expected text room list");
+    };
+    match proto::decode(&text)? {
+        Message::RoomList { rooms } => Ok(rooms),
+        Message::Error { reason } => anyhow::bail!("{reason}"),
+        other => anyhow::bail!("unexpected reply: {other:?}"),
+    }
+}
+
 /// Offline direct mode: no server, no room; one manually configured peer.
 pub async fn run_direct(
     cfg: ResolvedConfig,

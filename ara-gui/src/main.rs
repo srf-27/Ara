@@ -1,17 +1,23 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-//! Minimal Windows GUI: room form, member list, connection state and log panel.
-//! TUN wiring and transfer progress are wired in later stage; this binary is
-//! intentionally console-less (`windows_subsystem = "windows"`).
+//! Windows GUI: room form, member list, connection state, TUN data plane and
+//! log panel. Console-less by design (`windows_subsystem = "windows"`).
 
 use std::net::Ipv4Addr;
 use std::sync::mpsc::{channel, Receiver};
+use std::time::Duration;
 
 use ara::client::UiEvent;
 use ara::config::ResolvedConfig;
 use eframe::egui;
+use futures_util::StreamExt;
 
 fn main() -> eframe::Result<()> {
+    if let Ok(instance) = single_instance::SingleInstance::new("ara-gui") {
+        if !instance.is_single() {
+            return Ok(());
+        }
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([980.0, 640.0])
@@ -97,17 +103,17 @@ impl AraApp {
             room_code: self.room.clone(),
             room_password: self.password.clone(),
             access_token: String::new(),
-            nickname: self.nickname.clone(),
-            create_room: self.create,
             server_pub: String::new(),
             server_cert_pem: String::new(),
+            nickname: self.nickname.clone(),
+            create_room: self.create,
             direct_peer_addr: None,
             direct_peer_key: String::new(),
             direct_peer_vip: None,
             direct_vip: None,
         };
         let (tx, rx) = channel::<UiEvent>();
-        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();
+        let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
         self.rx = Some(rx);
         self.status = "连接中…".into();
         self.connected = true;
@@ -127,17 +133,32 @@ impl AraApp {
                     }
                 }
             });
-            let (_ip_out_tx, ip_out_rx) = tokio::sync::mpsc::channel(256);
-            let (ip_in_tx, mut ip_in_rx) = tokio::sync::mpsc::channel(256);
-            rt.spawn(async move {
-                while ip_in_rx.recv().await.is_some() {}
+            let (from_tun_tx, from_tun_rx) = tokio::sync::mpsc::channel(256);
+            let (to_tun_tx, to_tun_rx) = tokio::sync::mpsc::channel(256);
+            let (assigned_tx, assigned_rx) = tokio::sync::oneshot::channel();
+            rt.spawn(ara::client::run(cfg, from_tun_rx, to_tun_tx, assigned_tx, Some(etx)));
+            let vip = rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(20), assigned_rx)
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
             });
-            let (assigned_tx, _assigned_rx) = tokio::sync::oneshot::channel();
-            let result =
-                rt.block_on(ara::client::run(cfg, ip_out_rx, ip_in_tx, assigned_tx, Some(etx)));
-            if let Err(e) = result {
-                let _ = tx.send(UiEvent::Status(format!("连接结束：{e}")));
+            match vip {
+                Some(vip) => {
+                    if let Err(e) = rt.block_on(tun_up(vip, from_tun_tx, to_tun_rx)) {
+                        let _ = tx.send(UiEvent::Status(format!("TUN 创建失败：{e}")));
+                    }
+                }
+                None => {
+                    let _ = tx.send(UiEvent::Status("加入房间超时".into()));
+                }
             }
+            // Keep the runtime (and its TUN tasks) alive while the GUI runs.
+            rt.block_on(async {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
+                }
+            });
         });
     }
 
@@ -172,10 +193,67 @@ impl AraApp {
     }
 }
 
+async fn tun_up(
+    vip: Ipv4Addr,
+    from_tun_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    mut to_tun_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+) -> anyhow::Result<()> {
+    #[cfg(target_os = "windows")]
+    ensure_wintun()?;
+    let mut config = tun::configure();
+    config
+        .name("ara")
+        .address(vip)
+        .netmask(prefix_mask(ara::VIRTUAL_PREFIX))
+        .mtu(ara::TUN_MTU as i32)
+        .layer(tun::Layer::L3)
+        .up();
+    let device = tun::create_as_async(&config)?;
+    let (mut sink, mut stream) = device.into_framed().split();
+    tokio::spawn(async move {
+        use futures_util::StreamExt;
+        while let Some(pkt) = stream.next().await {
+            match pkt {
+                Ok(p) => {
+                    if from_tun_tx.send(p.get_bytes().to_vec()).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    tokio::spawn(async move {
+        use futures_util::SinkExt;
+        while let Some(bytes) = to_tun_rx.recv().await {
+            if sink.send(tun::TunPacket::new(bytes)).await.is_err() {
+                break;
+            }
+        }
+    });
+    Ok(())
+}
+
+fn prefix_mask(prefix: u8) -> Ipv4Addr {
+    let mask: u32 = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    Ipv4Addr::from(mask)
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_wintun() -> anyhow::Result<()> {
+    const DLL: &[u8] = include_bytes!("../../ara/vendor/wintun.dll");
+    let exe = std::env::current_exe()?;
+    let dll = exe.parent().map(|p| p.join("wintun.dll")).ok_or_else(|| anyhow::anyhow!("exe dir"))?;
+    if !dll.exists() {
+        std::fs::write(&dll, DLL)?;
+    }
+    Ok(())
+}
+
 impl eframe::App for AraApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_events();
-        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        ctx.request_repaint_after(Duration::from_millis(250));
 
         egui::TopBottomPanel::top("status").show(ctx, |ui| {
             ui.horizontal(|ui| {

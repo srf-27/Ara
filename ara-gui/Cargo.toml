@@ -1,0 +1,11 @@
+[package]
+name = "ara-gui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ara = { path = "../ara" }
+eframe = { version = "0.29", default-features = false, features = ["glow"] }
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true

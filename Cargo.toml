@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["ara", "ara-server"]
+members = ["ara", "ara-server", "ara-gui"]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

@@ -71,12 +71,22 @@ impl std::fmt::Display for FatalKicked {
 }
 impl std::error::Error for FatalKicked {}
 
+/// Events surfaced to the GUI; the CLI ignores them.
+#[derive(Debug, Clone)]
+pub enum UiEvent {
+    Welcome { virtual_ip: Ipv4Addr, room_code: String },
+    Peers(Vec<PeerInfo>),
+    Kicked(String),
+    Status(String),
+}
+
 /// Run the client forever (reconnecting), until a fatal error.
 pub async fn run(
     cfg: ResolvedConfig,
     ip_out: mpsc::Receiver<Vec<u8>>,
     ip_in: mpsc::Sender<Vec<u8>>,
     assigned: oneshot::Sender<Ipv4Addr>,
+    events: Option<mpsc::UnboundedSender<UiEvent>>,
 ) -> Result<()> {
     let socket = Arc::new(bind_udp(cfg.local_port).context("bind local UDP")?);
     let local_port = socket.local_addr()?.port();
@@ -120,6 +130,7 @@ pub async fn run(
             &mut relay_rx,
             &mut assigned,
             &mut snapshot,
+            &events,
         )
         .await;
         // Persist the last known room/VIP/member table on every disconnect or
@@ -152,6 +163,7 @@ async fn session(
     relay_rx: &mut mpsc::Receiver<Vec<u8>>,
     assigned: &mut Option<oneshot::Sender<Ipv4Addr>>,
     snapshot: &mut RoomSnapshot,
+    events: &Option<mpsc::UnboundedSender<UiEvent>>,
 ) -> Result<()> {
     let server: SocketAddr = tokio::net::lookup_host((cfg.server_host.as_str(), cfg.server_port))
         .await?
@@ -195,6 +207,12 @@ async fn session(
         _ => anyhow::bail!("expected text welcome"),
     };
     snapshot.virtual_ip = Some(vip);
+    if let Some(tx) = events {
+        let _ = tx.send(UiEvent::Welcome {
+            virtual_ip: vip,
+            room_code: snapshot.room_code.clone(),
+        });
+    }
     tracing::info!("assigned virtual IP {vip}");
     if let Some(tx) = assigned.take() {
         let _ = tx.send(vip);
@@ -262,12 +280,18 @@ async fn session(
                                 let code = snapshot.room_code.clone();
                                 let vip = snapshot.virtual_ip;
                                 *snapshot = RoomSnapshot::from_peers(&code, vip, &others);
+                                if let Some(tx) = events {
+                                    let _ = tx.send(UiEvent::Peers(others.clone()));
+                                }
                                 let _ = cmd_tx.try_send(Command::SetPeers(others));
                             }
                             Ok(Message::RoomList { rooms }) => {
                                 tracing::info!("room list: {rooms:?}");
                             }
                             Ok(Message::Kicked { reason }) => {
+                                if let Some(tx) = events {
+                                    let _ = tx.send(UiEvent::Kicked(reason.clone()));
+                                }
                                 return Err(FatalKicked(reason).into());
                             }
                             Ok(_) => {}

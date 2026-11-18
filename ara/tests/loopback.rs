@@ -47,7 +47,7 @@ async fn start_client(server_port: u16, tag: &str) -> Client {
     let (to_engine, engine_out) = mpsc::channel(256);
     let (engine_in, from_engine) = mpsc::channel(256);
     let (tx, rx) = oneshot::channel();
-    tokio::spawn(ara::client::run(cfg, engine_out, engine_in, tx));
+    tokio::spawn(ara::client::run(cfg, engine_out, engine_in, tx, None));
     let vip = tokio::time::timeout(Duration::from_secs(10), rx)
         .await
         .expect("assigned IP timeout")

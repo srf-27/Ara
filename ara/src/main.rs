@@ -142,7 +142,7 @@ async fn main() -> Result<()> {
     let (to_tun_tx, mut to_tun_rx) = mpsc::channel::<Vec<u8>>(256);
     let (assigned_tx, assigned_rx) = oneshot::channel();
 
-    let client = tokio::spawn(ara::client::run(cfg, from_tun_rx, to_tun_tx, assigned_tx));
+    let client = tokio::spawn(ara::client::run(cfg, from_tun_rx, to_tun_tx, assigned_tx, None));
 
     let vip = assigned_rx
         .await

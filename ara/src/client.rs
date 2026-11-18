@@ -21,6 +21,23 @@ use crate::{stun, HEARTBEAT_INTERVAL_SECS};
 /// Fallback STUN servers for when our signaling server runs TCP-only.
 const PUBLIC_STUN: &[&str] = &["stun.qq.com:3478", "stun.miwifi.com:3478"];
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn own_public_key_is_stable() {
+        let dir = std::env::temp_dir().join(format!("ara-id-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("identity.key");
+        let a = own_public_key(Some(&path));
+        let b = own_public_key(Some(&path));
+        assert_eq!(a, b);
+        assert!(!a.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
 /// Persisted device identity so virtual IPs stay stable across restarts.
 fn load_or_create_secret(override_path: Option<&std::path::Path>) -> StaticSecret {
     use base64::Engine as _;
@@ -151,6 +168,60 @@ pub async fn run(
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(30));
+    }
+}
+
+/// Public key (device ID) for the current identity, without starting a session.
+pub fn own_public_key(identity_path: Option<&std::path::Path>) -> String {
+    let secret = load_or_create_secret(identity_path);
+    encode_key(&PublicKey::from(&secret))
+}
+
+/// Offline direct mode: no server, no room; one manually configured peer.
+pub async fn run_direct(
+    cfg: ResolvedConfig,
+    ip_out: mpsc::Receiver<Vec<u8>>,
+    ip_in: mpsc::Sender<Vec<u8>>,
+    assigned: oneshot::Sender<Ipv4Addr>,
+    events: Option<mpsc::UnboundedSender<UiEvent>>,
+) -> Result<()> {
+    let vip = cfg.direct_vip.context("missing own VIP for direct mode")?;
+    let peer_addr = cfg.direct_peer_addr.context("missing --peer address")?;
+    let peer_vip = cfg.direct_peer_vip.context("missing --peer-vip")?;
+    if cfg.direct_peer_key.is_empty() {
+        anyhow::bail!("missing --peer-key (peer public key)");
+    }
+    let socket = Arc::new(bind_udp(cfg.local_port).context("bind local UDP")?);
+    let secret = load_or_create_secret(cfg.identity_path.as_deref());
+    let (cmd_tx, cmd_rx) = mpsc::channel(256);
+    let (relay_tx, mut relay_rx) = mpsc::channel::<Vec<u8>>(256);
+    let engine = Engine::new(socket, secret, ip_out, ip_in, relay_tx, cmd_rx, cmd_tx.clone());
+    tokio::spawn(async move {
+        let _ = engine.run().await;
+    });
+    tokio::spawn(async move {
+        while relay_rx.recv().await.is_some() {}
+    });
+    cmd_tx
+        .send(Command::AddPeer(PeerInfo {
+            public_key: cfg.direct_peer_key.clone(),
+            virtual_ip: peer_vip,
+            candidates: vec![peer_addr],
+            tcp: vec![],
+            symmetric: false,
+            nickname: String::new(),
+        }))
+        .await?;
+    let _ = assigned.send(vip);
+    if let Some(tx) = events {
+        let _ = tx.send(UiEvent::Welcome {
+            virtual_ip: vip,
+            room_code: "direct".into(),
+        });
+    }
+    tracing::info!("direct mode: {vip} <-> {peer_vip} at {peer_addr}");
+    loop {
+        tokio::time::sleep(Duration::from_secs(3600)).await;
     }
 }
 

@@ -118,6 +118,10 @@ impl ClientConfig {
             server_pub: access.as_ref().map(|a| a.server_pub.clone()).unwrap_or_default(),
             nickname: self.nickname.unwrap_or_default(),
             create_room,
+            direct_peer_addr: None,
+            direct_peer_key: String::new(),
+            direct_peer_vip: None,
+            direct_vip: None,
         })
     }
 }
@@ -142,6 +146,11 @@ pub struct ResolvedConfig {
     pub server_pub: String,
     pub nickname: String,
     pub create_room: bool,
+    /// Offline direct mode: peer address, peer public key, peer VIP, own VIP.
+    pub direct_peer_addr: Option<std::net::SocketAddr>,
+    pub direct_peer_key: String,
+    pub direct_peer_vip: Option<std::net::Ipv4Addr>,
+    pub direct_vip: Option<std::net::Ipv4Addr>,
 }
 
 #[cfg(test)]

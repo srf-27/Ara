@@ -44,6 +44,10 @@ async fn start_client(server_port: u16, tag: &str) -> Client {
         nickname: String::new(),
         create_room: false,
         server_pub: String::new(),
+        direct_peer_addr: None,
+        direct_peer_key: String::new(),
+        direct_peer_vip: None,
+        direct_vip: None,
     };
     let (to_engine, engine_out) = mpsc::channel(256);
     let (engine_in, from_engine) = mpsc::channel(256);

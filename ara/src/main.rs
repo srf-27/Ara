@@ -1,8 +1,8 @@
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use ara::config::ClientConfig;
+use ara::config::{ClientConfig, ResolvedConfig};
 use ara::{TUN_MTU, VIRTUAL_PREFIX};
 use clap::{Parser, Subcommand};
 use futures_util::{SinkExt, StreamExt};
@@ -58,6 +58,25 @@ enum Command {
         #[arg(long)]
         access: Option<PathBuf>,
     },
+    /// Offline direct mode: connect to one peer by IP, no server/room.
+    IpConnect {
+        /// Peer address, IP:port.
+        #[arg(long)]
+        peer: String,
+        /// Peer public key (base64, shown by `ara id` or the peer's GUI).
+        #[arg(long)]
+        peer_key: String,
+        /// Peer virtual IP, e.g. 10.99.0.3.
+        #[arg(long)]
+        peer_vip: String,
+        /// Own virtual IP, e.g. 10.99.0.2.
+        #[arg(long)]
+        vip: String,
+        #[arg(long)]
+        nickname: Option<String>,
+    },
+    /// Print this device's public key (the ID shared with peers).
+    Id,
     /// List rooms visible on the server using an access file.
     Rooms {
         #[arg(long)]
@@ -93,8 +112,12 @@ async fn main() -> Result<()> {
         )
         .init();
     let cli = Cli::parse();
-    let cfg = match cli.command {
+    match cli.command {
         Command::Rooms { access } => return list_rooms(&access).await,
+        Command::Id => {
+            println!("{}", ara::client::own_public_key(None));
+            return Ok(());
+        }
         Command::Send { to, file } => {
             let addr: SocketAddr = to
                 .parse()
@@ -103,6 +126,39 @@ async fn main() -> Result<()> {
         }
         Command::Recv { dir, port, auto_accept } => {
             return ara::transfer::serve(dir, port, auto_accept).await;
+        }
+        Command::IpConnect { peer, peer_key, peer_vip, vip, nickname } => {
+            let peer_addr: SocketAddr = peer.parse().context("--peer must be IP:port")?;
+            let own_vip: Ipv4Addr = vip.parse().context("invalid --vip")?;
+            let peer_ip: Ipv4Addr = peer_vip.parse().context("invalid --peer-vip")?;
+            let cfg = ResolvedConfig {
+                network: String::new(),
+                secret: String::new(),
+                server_host: String::new(),
+                server_port: 0,
+                local_port: 0,
+                tcp_port: 0,
+                identity_path: None,
+                room_code: String::new(),
+                room_password: String::new(),
+                access_token: String::new(),
+                server_pub: String::new(),
+                nickname: nickname.unwrap_or_default(),
+                create_room: false,
+                direct_peer_addr: Some(peer_addr),
+                direct_peer_key: peer_key,
+                direct_peer_vip: Some(peer_ip),
+                direct_vip: Some(own_vip),
+            };
+            let (from_tun_tx, from_tun_rx) = mpsc::channel::<Vec<u8>>(256);
+            let (to_tun_tx, to_tun_rx) = mpsc::channel::<Vec<u8>>(256);
+            let (assigned_tx, assigned_rx) = oneshot::channel();
+            let client =
+                tokio::spawn(ara::client::run_direct(cfg, from_tun_rx, to_tun_tx, assigned_tx, None));
+            let vip = assigned_rx.await.context("direct mode failed to start")?;
+            let result = run_tun(vip, from_tun_tx, to_tun_rx).await;
+            client.abort();
+            return result;
         }
         Command::Up {
             config,
@@ -129,25 +185,31 @@ async fn main() -> Result<()> {
                     }
                 }
             };
-            file_cfg
+            let cfg = file_cfg
                 .merge_cli(
                     network, secret, server, port, tcp_port, identity, room, password, nickname,
                     create, access,
                 )
-                .validate()?
+                .validate()?;
+            let (from_tun_tx, from_tun_rx) = mpsc::channel::<Vec<u8>>(256);
+            let (to_tun_tx, to_tun_rx) = mpsc::channel::<Vec<u8>>(256);
+            let (assigned_tx, assigned_rx) = oneshot::channel();
+            let client = tokio::spawn(ara::client::run(cfg, from_tun_rx, to_tun_tx, assigned_tx, None));
+            let vip = assigned_rx
+                .await
+                .context("failed to join room (wrong password/full room, or client exited; see logs)")?;
+            let result = run_tun(vip, from_tun_tx, to_tun_rx).await;
+            client.abort();
+            return result;
         }
-    };
+    }
+}
 
-    let (from_tun_tx, from_tun_rx) = mpsc::channel::<Vec<u8>>(256);
-    let (to_tun_tx, mut to_tun_rx) = mpsc::channel::<Vec<u8>>(256);
-    let (assigned_tx, assigned_rx) = oneshot::channel();
-
-    let client = tokio::spawn(ara::client::run(cfg, from_tun_rx, to_tun_tx, assigned_tx, None));
-
-    let vip = assigned_rx
-        .await
-        .context("failed to join room (wrong password/full room, or client exited; see logs)")?;
-
+async fn run_tun(
+    vip: Ipv4Addr,
+    from_tun_tx: mpsc::Sender<Vec<u8>>,
+    mut to_tun_rx: mpsc::Receiver<Vec<u8>>,
+) -> Result<()> {
     #[cfg(target_os = "windows")]
     ensure_wintun().context("prepare wintun.dll")?;
 
@@ -165,7 +227,6 @@ async fn main() -> Result<()> {
     tracing::info!("TUN device up with {vip}/{VIRTUAL_PREFIX}, MTU {TUN_MTU}");
     let (mut tun_sink, mut tun_stream) = device.into_framed().split();
 
-    // TUN -> engine
     tokio::spawn(async move {
         while let Some(pkt) = tun_stream.next().await {
             match pkt {
@@ -181,7 +242,6 @@ async fn main() -> Result<()> {
             }
         }
     });
-    // engine -> TUN
     tokio::spawn(async move {
         while let Some(bytes) = to_tun_rx.recv().await {
             if tun_sink.send(TunPacket::new(bytes)).await.is_err() {
@@ -192,7 +252,6 @@ async fn main() -> Result<()> {
 
     tracing::info!("ara is running; press Ctrl+C to stop");
     tokio::signal::ctrl_c().await?;
-    client.abort();
     tracing::info!("shutting down");
     Ok(())
 }

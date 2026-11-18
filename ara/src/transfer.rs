@@ -64,7 +64,13 @@ pub fn save_state(state: &TransferState) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).ok();
     }
-    std::fs::write(&path, serde_json::to_string_pretty(state)?).context("write transfers.json")
+    std::fs::write(&path, serde_json::to_string_pretty(state)?).context("write transfers.json")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 pub fn clear_state() {

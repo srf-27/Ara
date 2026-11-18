@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::{PublicKey, StaticSecret};
+use sha2::{Digest, Sha256};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -41,6 +42,45 @@ pub fn decode_key(s: &str) -> Result<PublicKey> {
         .context("base64 public key")?;
     let arr: [u8; 32] = bytes.try_into().map_err(|_| anyhow::anyhow!("key not 32 bytes"))?;
     Ok(PublicKey::from(arr))
+}
+
+pub fn public_key_b64(secret: &StaticSecret) -> String {
+    encode_key(&PublicKey::from(secret))
+}
+
+/// Proof of possession: both sides derive the same X25519 shared secret and
+/// hash it with the server nonce. X25519 is a DH key, not a signature key.
+pub fn dh_proof(secret: &StaticSecret, peer: &PublicKey, nonce: &str) -> String {
+    let shared = secret.diffie_hellman(peer);
+    let mut h = Sha256::new();
+    h.update(shared.as_bytes());
+    h.update(nonce.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// Load or create the server's long-term X25519 key (0600 on Unix).
+pub fn load_or_create_server_key(path: &std::path::Path) -> StaticSecret {
+    if let Ok(text) = std::fs::read_to_string(path) {
+        if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(text.trim()) {
+            if let Ok(arr) = <[u8; 32]>::try_from(bytes) {
+                return StaticSecret::from(arr);
+            }
+        }
+    }
+    let secret = StaticSecret::random_from_rng(rand::rngs::OsRng);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(
+        path,
+        base64::engine::general_purpose::STANDARD.encode(secret.to_bytes()),
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    secret
 }
 
 pub enum Command {
@@ -768,13 +808,22 @@ mod tests {
     }
 
     #[test]
-    fn peer_relay_frame_roundtrip() {
-        let dest = [7u8; 32];
+    fn peer_relay_frame_roundtrip() {        let dest = [7u8; 32];
         let wg = b"wg-bytes";
         let frame = peer_relay_frame(&dest, wg);
         assert!(frame.starts_with(PEER_RELAY_MAGIC));
         assert_eq!(&frame[4..36], &dest);
         assert_eq!(&frame[PEER_RELAY_HEADER..], wg);
         assert_eq!(peer_key(&dest), encode_key(&PublicKey::from(dest)));
+    }
+
+    #[test]
+    fn dh_proof_matches_on_both_sides() {
+        let a = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let b = StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let pa = PublicKey::from(&a);
+        let pb = PublicKey::from(&b);
+        assert_eq!(dh_proof(&a, &pb, "nonce"), dh_proof(&b, &pa, "nonce"));
+        assert_ne!(dh_proof(&a, &pb, "n1"), dh_proof(&a, &pb, "n2"));
     }
 }

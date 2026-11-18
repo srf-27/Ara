@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use ara::proto::{self, Message, PeerInfo, RoomInfo};
 use ara::{stun, OFFLINE_AFTER_SECS, VIRTUAL_PREFIX, VIRTUAL_SUBNET};
+use boringtun::x25519::StaticSecret;
 use futures_util::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
 use tokio::net::{TcpListener, UdpSocket};
@@ -124,6 +125,11 @@ impl State {
 
     pub fn verify_token(&self, token: &str) -> bool {
         self.tokens.is_empty() || self.tokens.get(token).is_some_and(|t| !t.revoked)
+    }
+
+    /// Access tokens configured -> the server requires a DH challenge.
+    pub fn access_enabled(&self) -> bool {
+        !self.tokens.is_empty()
     }
 
     pub fn is_banned(&self, public_key: &str) -> bool {
@@ -440,6 +446,12 @@ pub async fn serve(
     let (bcast, _) = broadcast::channel::<(String, String)>(256);
     let (kick_tx, _) = broadcast::channel::<(String, String)>(64);
     let registry: Registry = Arc::new(Mutex::new(HashMap::new()));
+    let server_key = Arc::new(ara::engine::load_or_create_server_key(
+        &state_path
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("ara-server-state.json"))
+            .with_file_name("server.key"),
+    ));
 
     if let Some(udp) = udp {
         tokio::spawn(async move {
@@ -506,11 +518,14 @@ pub async fn serve(
         let kick_tx = kick_tx.clone();
         let registry = registry.clone();
         let state_path = state_path.clone();
+        let server_key = server_key.clone();
         tokio::spawn(async move {
             match tokio_tungstenite::accept_async(stream).await {
                 Ok(ws) => {
-                    if let Err(e) =
-                        handle_conn(ws, state, bcast, kick_tx, registry, state_path).await
+                    if let Err(e) = handle_conn(
+                        ws, state, bcast, kick_tx, registry, state_path, server_key,
+                    )
+                    .await
                     {
                         tracing::debug!("conn {addr} ended: {e}");
                     }
@@ -546,6 +561,7 @@ async fn handle_conn(
     kick_tx: KickTx,
     registry: Registry,
     state_path: Option<std::path::PathBuf>,
+    server_key: Arc<StaticSecret>,
 ) -> Result<()> {
     let (mut sink, mut stream) = ws.split();
 
@@ -586,6 +602,39 @@ async fn handle_conn(
             })))
             .await;
         anyhow::bail!("invalid access token");
+    }
+
+    // Access-enabled servers require proof of possession of the device key.
+    if state.lock().await.access_enabled() {
+        let nonce = format!(
+            "{:016x}{:016x}",
+            rand::random::<u64>(),
+            rand::random::<u64>()
+        );
+        sink.send(WsMessage::Text(proto::encode(&Message::Challenge {
+            nonce: nonce.clone(),
+        })))
+        .await?;
+        let reply = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .context("challenge timeout")?
+            .context("closed during challenge")?
+            .context("ws read during challenge")?;
+        let WsMessage::Text(text) = reply else {
+            anyhow::bail!("expected challenge reply");
+        };
+        let Message::ChallengeReply { proof } = proto::decode(&text)? else {
+            anyhow::bail!("expected challenge reply");
+        };
+        let client_pub = ara::engine::decode_key(&public_key).context("client public key")?;
+        if ara::engine::dh_proof(&server_key, &client_pub, &nonce) != proof {
+            let _ = sink
+                .send(WsMessage::Text(proto::encode(&Message::Error {
+                    reason: "bad challenge proof".into(),
+                })))
+                .await;
+            anyhow::bail!("bad challenge proof");
+        }
     }
 
     if room_code.is_empty() && !create_room && !network.is_empty() {
@@ -830,8 +879,10 @@ mod tests {
     #[test]
     fn access_tokens_gate_registration() {
         let mut s = State::new();
+        assert!(!s.access_enabled());
         assert!(s.verify_token("anything")); // no tokens configured -> legacy open
         let token = s.gen_token();
+        assert!(s.access_enabled());
         assert!(s.verify_token(&token));
         assert!(!s.verify_token("bogus"));
         s.tokens.get_mut(&token).unwrap().revoked = true;

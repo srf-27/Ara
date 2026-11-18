@@ -94,7 +94,7 @@ pub async fn run(
     let public_key = encode_key(&PublicKey::from(&secret));
     let (cmd_tx, cmd_rx) = mpsc::channel(256);
     let (relay_tx, mut relay_rx) = mpsc::channel::<Vec<u8>>(256);
-    let engine = Engine::new(socket.clone(), secret, ip_out, ip_in, relay_tx, cmd_rx, cmd_tx.clone());
+    let engine = Engine::new(socket.clone(), secret.clone(), ip_out, ip_in, relay_tx, cmd_rx, cmd_tx.clone());
     tokio::spawn(async move {
         if let Err(e) = engine.run().await {
             tracing::error!("data plane stopped: {e}");
@@ -126,6 +126,7 @@ pub async fn run(
             local_port,
             tcp_port,
             &public_key,
+            &secret,
             &cmd_tx,
             &mut relay_rx,
             &mut assigned,
@@ -159,6 +160,7 @@ async fn session(
     local_port: u16,
     tcp_port: u16,
     public_key: &str,
+    secret: &StaticSecret,
     cmd_tx: &mpsc::Sender<Command>,
     relay_rx: &mut mpsc::Receiver<Vec<u8>>,
     assigned: &mut Option<oneshot::Sender<Ipv4Addr>>,
@@ -194,8 +196,24 @@ async fn session(
     };
     sink.send(WsMessage::Text(proto::encode(&register))).await?;
 
-    // First reply: Welcome or Error.
-    let vip = match stream.next().await.context("closed before welcome")?? {
+    // First reply may be a DH challenge (access-enabled server) or Welcome.
+    let mut first = stream.next().await.context("closed before welcome")??;
+    if let WsMessage::Text(t) = &first {
+        if let Ok(Message::Challenge { nonce }) = proto::decode(t) {
+            if cfg.server_pub.is_empty() {
+                return Err(FatalAuth(
+                    "server requires a DH challenge but access file has no server_pub".into(),
+                )
+                .into());
+            }
+            let server_pub = crate::engine::decode_key(&cfg.server_pub)?;
+            let proof = crate::engine::dh_proof(secret, &server_pub, &nonce);
+            sink.send(WsMessage::Text(proto::encode(&Message::ChallengeReply { proof })))
+                .await?;
+            first = stream.next().await.context("closed after challenge")??;
+        }
+    }
+    let vip = match first {
         WsMessage::Text(t) => match proto::decode(&t)? {
             Message::Welcome { virtual_ip, room_code, .. } => {
                 snapshot.room_code = room_code;

@@ -99,6 +99,7 @@ impl AraApp {
             access_token: String::new(),
             nickname: self.nickname.clone(),
             create_room: self.create,
+            server_pub: String::new(),
         };
         let (tx, rx) = channel::<UiEvent>();
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel();

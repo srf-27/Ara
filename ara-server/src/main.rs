@@ -78,10 +78,14 @@ async fn main() -> Result<()> {
             state.load_tokens(&access);
             let token = state.gen_token();
             state.save_tokens(&access)?;
+            let server_key =
+                ara::engine::load_or_create_server_key(&args.state.with_file_name("server.key"));
+            let server_pub = ara::engine::public_key_b64(&server_key);
             let file = serde_json::json!({
                 "server": server,
                 "token": token,
                 "name": name.unwrap_or_default(),
+                "server_pub": server_pub,
             });
             let path = args.state.with_file_name("access-file.json");
             std::fs::write(&path, serde_json::to_string_pretty(&file)?)?;

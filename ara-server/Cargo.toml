@@ -17,4 +17,5 @@ tracing-subscriber.workspace = true
 base64 = "0.22"
 sha2 = "0.10"
 rand = "0.8"
+boringtun = "0.6"
 tracing-appender = "0.2"

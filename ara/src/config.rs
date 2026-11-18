@@ -29,6 +29,9 @@ pub struct AccessFile {
     pub token: String,
     #[serde(default)]
     pub name: String,
+    /// Server X25519 public key used for the DH challenge.
+    #[serde(default)]
+    pub server_pub: String,
 }
 
 impl ClientConfig {
@@ -111,7 +114,8 @@ impl ClientConfig {
             identity_path: self.identity,
             room_code,
             room_password,
-            access_token: access.map(|a| a.token).unwrap_or_default(),
+            access_token: access.as_ref().map(|a| a.token.clone()).unwrap_or_default(),
+            server_pub: access.as_ref().map(|a| a.server_pub.clone()).unwrap_or_default(),
             nickname: self.nickname.unwrap_or_default(),
             create_room,
         })
@@ -134,6 +138,8 @@ pub struct ResolvedConfig {
     pub room_code: String,
     pub room_password: String,
     pub access_token: String,
+    /// Server public key for the DH challenge (empty = legacy server).
+    pub server_pub: String,
     pub nickname: String,
     pub create_room: bool,
 }

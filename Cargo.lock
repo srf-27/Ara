@@ -179,6 +179,7 @@ dependencies = [
  "anyhow",
  "ara",
  "base64 0.22.1",
+ "boringtun",
  "clap",
  "futures-util",
  "rand",

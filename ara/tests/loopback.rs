@@ -44,6 +44,7 @@ async fn start_client(server_port: u16, tag: &str) -> Client {
         nickname: String::new(),
         create_room: false,
         server_pub: String::new(),
+        server_cert_pem: String::new(),
         direct_peer_addr: None,
         direct_peer_key: String::new(),
         direct_peer_vip: None,
@@ -88,7 +89,7 @@ async fn two_clients_exchange_ip_packets() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let udp = Arc::new(bind_udp(port).unwrap());
-    tokio::spawn(ara_server::serve(listener, Some(udp), None));
+    tokio::spawn(ara_server::serve(listener, Some(udp), None, None));
 
     let mut a = start_client(port, "a").await;
     let mut b = start_client(port, "b").await;
@@ -248,7 +249,7 @@ async fn relay_routes_binary_frames() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(ara_server::serve(listener, None, None));
+    tokio::spawn(ara_server::serve(listener, None, None, None));
     let url = format!("ws://127.0.0.1:{port}");
 
     let key_a = [1u8; 32];
@@ -306,7 +307,7 @@ async fn relay_throughput_loopback() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(ara_server::serve(listener, None, None));
+    tokio::spawn(ara_server::serve(listener, None, None, None));
     let url = format!("ws://127.0.0.1:{port}");
     let b64 = base64::engine::general_purpose::STANDARD;
     let reg = |key: [u8; 32]| {
@@ -378,7 +379,7 @@ async fn engine_relay_throughput_loopback() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(ara_server::serve(listener, None, None));
+    tokio::spawn(ara_server::serve(listener, None, None, None));
     let url = format!("ws://127.0.0.1:{port}");
     let blackhole: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
 

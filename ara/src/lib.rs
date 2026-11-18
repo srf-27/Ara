@@ -5,6 +5,7 @@ pub mod engine;
 pub mod proto;
 pub mod room_state;
 pub mod stun;
+pub mod tls;
 pub mod transfer;
 
 use std::net::Ipv4Addr;

@@ -143,6 +143,7 @@ async fn main() -> Result<()> {
                 room_password: String::new(),
                 access_token: String::new(),
                 server_pub: String::new(),
+                server_cert_pem: String::new(),
                 nickname: nickname.unwrap_or_default(),
                 create_room: false,
                 direct_peer_addr: Some(peer_addr),

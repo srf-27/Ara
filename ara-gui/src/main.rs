@@ -100,6 +100,7 @@ impl AraApp {
             nickname: self.nickname.clone(),
             create_room: self.create,
             server_pub: String::new(),
+            server_cert_pem: String::new(),
             direct_peer_addr: None,
             direct_peer_key: String::new(),
             direct_peer_vip: None,

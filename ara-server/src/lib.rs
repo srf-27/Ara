@@ -1,5 +1,7 @@
 //! Control-plane server: pure state plus the WebSocket/STUN runtime.
 
+pub mod tls;
+
 use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
@@ -12,6 +14,7 @@ use ara::{stun, OFFLINE_AFTER_SECS, VIRTUAL_PREFIX, VIRTUAL_SUBNET};
 use boringtun::x25519::StaticSecret;
 use futures_util::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{broadcast, Mutex};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -421,6 +424,7 @@ pub async fn serve(
     listener: TcpListener,
     udp: Option<Arc<UdpSocket>>,
     state_path: Option<std::path::PathBuf>,
+    tls: Option<tokio_rustls::TlsAcceptor>,
 ) -> Result<()> {
     let state = Arc::new(Mutex::new(State::new()));
     if let Some(path) = &state_path {
@@ -511,30 +515,63 @@ pub async fn serve(
     loop {
         let (stream, addr) = listener.accept().await?;
         let _ = stream.set_nodelay(true);
-        let state = state.clone();
-        let bcast = bcast.clone();
-        let kick_tx = kick_tx.clone();
-        let registry = registry.clone();
-        let state_path = state_path.clone();
-        let server_key = server_key.clone();
+        let ctx = ConnCtx {
+            state: state.clone(),
+            bcast: bcast.clone(),
+            kick_tx: kick_tx.clone(),
+            registry: registry.clone(),
+            state_path: state_path.clone(),
+            server_key: server_key.clone(),
+        };
+        let tls = tls.clone();
         tokio::spawn(async move {
-            match tokio_tungstenite::accept_async(stream).await {
-                Ok(ws) => {
-                    if let Err(e) = handle_conn(
-                        ws, state, bcast, kick_tx, registry, state_path, server_key,
-                    )
-                    .await
-                    {
-                        tracing::debug!("conn {addr} ended: {e}");
-                    }
-                }
-                Err(e) => tracing::debug!("ws handshake {addr}: {e}"),
+            match tls {
+                Some(acceptor) => match acceptor.accept(stream).await {
+                    Ok(s) => match tokio_tungstenite::accept_async(s).await {
+                        Ok(ws) => serve_ws(ws, ctx, addr).await,
+                        Err(e) => tracing::debug!("ws handshake {addr}: {e}"),
+                    },
+                    Err(e) => tracing::debug!("tls accept {addr}: {e}"),
+                },
+                None => match tokio_tungstenite::accept_async(stream).await {
+                    Ok(ws) => serve_ws(ws, ctx, addr).await,
+                    Err(e) => tracing::debug!("ws handshake {addr}: {e}"),
+                },
             }
         });
     }
 }
 
 type Registry = Arc<Mutex<HashMap<String, (String, tokio::sync::mpsc::UnboundedSender<Vec<u8>>)>>>;
+
+#[derive(Clone)]
+struct ConnCtx {
+    state: Arc<Mutex<State>>,
+    bcast: Bcast,
+    kick_tx: KickTx,
+    registry: Registry,
+    state_path: Option<std::path::PathBuf>,
+    server_key: Arc<StaticSecret>,
+}
+
+async fn serve_ws<S>(ws: WebSocketStream<S>, ctx: ConnCtx, addr: SocketAddr)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    if let Err(e) = handle_conn(
+        ws,
+        ctx.state,
+        ctx.bcast,
+        ctx.kick_tx,
+        ctx.registry,
+        ctx.state_path,
+        ctx.server_key,
+    )
+    .await
+    {
+        tracing::debug!("conn {addr} ended: {e}");
+    }
+}
 
 async fn save_state(state: &Arc<Mutex<State>>, path: &Option<std::path::PathBuf>) {
     if let Some(path) = path {
@@ -552,15 +589,18 @@ async fn broadcast_peers(state: &Arc<Mutex<State>>, bcast: &Bcast, code: &str) {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_conn(
-    ws: WebSocketStream<tokio::net::TcpStream>,
+async fn handle_conn<S>(
+    ws: WebSocketStream<S>,
     state: Arc<Mutex<State>>,
     bcast: Bcast,
     kick_tx: KickTx,
     registry: Registry,
     state_path: Option<std::path::PathBuf>,
     server_key: Arc<StaticSecret>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let (mut sink, mut stream) = ws.split();
 
     let first = stream
@@ -705,12 +745,9 @@ async fn handle_conn(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn finish_conn(
-    mut sink: futures_util::stream::SplitSink<
-        WebSocketStream<tokio::net::TcpStream>,
-        WsMessage,
-    >,
-    mut stream: futures_util::stream::SplitStream<WebSocketStream<tokio::net::TcpStream>>,
+async fn finish_conn<S>(
+    mut sink: futures_util::stream::SplitSink<WebSocketStream<S>, WsMessage>,
+    mut stream: futures_util::stream::SplitStream<WebSocketStream<S>>,
     state: Arc<Mutex<State>>,
     bcast: Bcast,
     kick_tx: KickTx,
@@ -719,7 +756,10 @@ async fn finish_conn(
     code: String,
     public_key: String,
     vip: Ipv4Addr,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let mut rx = bcast.subscribe();
     let mut kick_rx = kick_tx.subscribe();
     let prefix = state.lock().await.prefix();
@@ -901,5 +941,22 @@ mod tests {
         let code = s.create_room("pw", "ka", "alice").unwrap();
         s.join_room(&code, "pw", "ka", "Alice", cands(), vec![], false).unwrap();
         assert_eq!(s.peers(&code)[0].nickname, "Alice");
+    }
+
+    #[test]
+    fn tls_cert_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("ara-tls-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cert_path = dir.join("server.crt");
+        let key_path = dir.join("server.key.pem");
+        let (cert, key) = tls::ensure_cert(&cert_path, &key_path, "localhost").unwrap();
+        assert!(cert.contains("BEGIN CERTIFICATE"));
+        assert!(key.contains("PRIVATE KEY"));
+        assert!(ara::tls::client_config(&cert).is_ok());
+        assert!(tls::acceptor(&cert, &key).is_ok());
+        let (cert2, _) = tls::ensure_cert(&cert_path, &key_path, "localhost").unwrap();
+        assert_eq!(cert, cert2);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

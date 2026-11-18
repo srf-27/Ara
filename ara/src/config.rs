@@ -32,6 +32,9 @@ pub struct AccessFile {
     /// Server X25519 public key used for the DH challenge.
     #[serde(default)]
     pub server_pub: String,
+    /// PEM certificate to trust for wss (pin-by-root).
+    #[serde(default)]
+    pub cert_pem: String,
 }
 
 impl ClientConfig {
@@ -116,6 +119,7 @@ impl ClientConfig {
             room_password,
             access_token: access.as_ref().map(|a| a.token.clone()).unwrap_or_default(),
             server_pub: access.as_ref().map(|a| a.server_pub.clone()).unwrap_or_default(),
+            server_cert_pem: access.as_ref().map(|a| a.cert_pem.clone()).unwrap_or_default(),
             nickname: self.nickname.unwrap_or_default(),
             create_room,
             direct_peer_addr: None,
@@ -144,6 +148,8 @@ pub struct ResolvedConfig {
     pub access_token: String,
     /// Server public key for the DH challenge (empty = legacy server).
     pub server_pub: String,
+    /// PEM certificate for wss (empty = plain ws).
+    pub server_cert_pem: String,
     pub nickname: String,
     pub create_room: bool,
     /// Offline direct mode: peer address, peer public key, peer VIP, own VIP.

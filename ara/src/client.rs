@@ -242,10 +242,24 @@ async fn session(
         .await?
         .next()
         .context("server address resolved to nothing")?;
-    let url = format!("ws://{server}");
-    let (ws, _) = tokio_tungstenite::connect_async(&url)
+    let url = if cfg.server_cert_pem.is_empty() {
+        format!("ws://{server}")
+    } else {
+        format!("wss://{server}")
+    };
+    let (ws, _) = if cfg.server_cert_pem.is_empty() {
+        tokio_tungstenite::connect_async(&url).await
+    } else {
+        let tls = crate::tls::client_config(&cfg.server_cert_pem)?;
+        tokio_tungstenite::connect_async_tls_with_config(
+            &url,
+            None,
+            false,
+            Some(tokio_tungstenite::Connector::Rustls(tls)),
+        )
         .await
-        .with_context(|| format!("connect {url}"))?;
+    }
+    .with_context(|| format!("connect {url}"))?;
     if let tokio_tungstenite::MaybeTlsStream::Plain(s) = ws.get_ref() {
         let _ = s.set_nodelay(true);
     }

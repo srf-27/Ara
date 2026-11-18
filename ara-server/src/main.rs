@@ -7,6 +7,15 @@ use ara::DEFAULT_PORT;
 use clap::{Parser, Subcommand};
 use tokio::net::TcpListener;
 
+fn host_of(addr: &str) -> String {
+    if let Ok(a) = addr.parse::<std::net::SocketAddr>() {
+        return a.ip().to_string();
+    }
+    addr.rsplit_once(':')
+        .map(|(h, _)| h.to_string())
+        .unwrap_or_else(|| addr.to_string())
+}
+
 #[derive(Parser)]
 #[command(name = "ara-server", about = "Ara control-plane server (signaling + STUN + rooms)")]
 struct Args {
@@ -25,6 +34,12 @@ struct Args {
     /// Directory for rotating server logs (default: alongside the state file).
     #[arg(long)]
     log_dir: Option<PathBuf>,
+    /// Serve wss with the generated self-signed certificate.
+    #[arg(long)]
+    tls: bool,
+    /// Hostname/IP embedded in the certificate SAN.
+    #[arg(long, default_value = "localhost")]
+    tls_host: String,
 }
 
 #[derive(Subcommand)]
@@ -81,11 +96,17 @@ async fn main() -> Result<()> {
             let server_key =
                 ara::engine::load_or_create_server_key(&args.state.with_file_name("server.key"));
             let server_pub = ara::engine::public_key_b64(&server_key);
+            let (cert_pem, _) = ara_server::tls::ensure_cert(
+                &args.state.with_file_name("server.crt"),
+                &args.state.with_file_name("server.key.pem"),
+                &host_of(&server),
+            )?;
             let file = serde_json::json!({
                 "server": server,
                 "token": token,
                 "name": name.unwrap_or_default(),
                 "server_pub": server_pub,
+                "cert_pem": cert_pem,
             });
             let path = args.state.with_file_name("access-file.json");
             std::fs::write(&path, serde_json::to_string_pretty(&file)?)?;
@@ -137,7 +158,17 @@ async fn main() -> Result<()> {
                 !args.no_stun,
                 log_dir.display()
             );
-            return ara_server::serve(listener, udp, Some(args.state)).await;
+            let tls = if args.tls {
+                let (cert, key) = ara_server::tls::ensure_cert(
+                    &args.state.with_file_name("server.crt"),
+                    &args.state.with_file_name("server.key.pem"),
+                    &args.tls_host,
+                )?;
+                Some(ara_server::tls::acceptor(&cert, &key)?)
+            } else {
+                None
+            };
+            return ara_server::serve(listener, udp, Some(args.state), tls).await;
         }
     };
     Ok(())
